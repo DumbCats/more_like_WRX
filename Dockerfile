@@ -1,5 +1,4 @@
-# Test-selection image for the Blast Radius track.
-# Pinned base image (the one the organizers specify).
+# Blast Radius entry image. Base: the pinned image the organizers labeled in.
 FROM python:3.13-slim@sha256:e48f59cdba69a3cbd9ed2cf0f348d90d45a8d350d98134cf1070bc106ee9ed90
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -9,33 +8,50 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     OMP_NUM_THREADS=1 \
     OPENBLAS_NUM_THREADS=1 \
     MKL_NUM_THREADS=1 \
-    BLAST_REPO=/repo \
-    BLAST_DATA=/data \
-    BLAST_TABLES=/predictor/tables \
-    BLAST_EXEC_CACHE=/predictor/cache \
-    BLAST_PREFILTER=/prefilter/main.py
+    BR_ROOT=/repo \
+    BR_DATA=/data \
+    BR_MAPS=/app/maps
 
-# --- Python packages: exact PyPI pins, installed without dependency resolution ----------------
+# 0. a faster build of the same interpreter (CPython 3.13.18 built with clang, profile-guided and
+#    link-time optimization; one file from a GitHub release at a fixed tag, sha256 checked). Test
+#    verdicts must be those of the pinned image, so its sqlite3 module is made to use the image's own
+#    SQLite (build/sitecustomize.py) and build/check_python.py compares the two interpreters. If the
+#    download or the check fails, "python" stays the pinned image's interpreter: same answers, more CPU.
+COPY build/fetch_python.py build/sitecustomize.py build/check_python.py /tmp/build/
+RUN mkdir -p /opt/br/bin \
+    && ( PYTHONHASHSEED=0 sh -c '/usr/local/bin/python3.13 /tmp/build/fetch_python.py /opt \
+           && cp /tmp/build/sitecustomize.py /opt/python/lib/python3.13/site-packages/sitecustomize.py \
+           && /opt/python/bin/python3.13 /tmp/build/check_python.py /usr/local/bin/python3.13' \
+         && ln -s /opt/python/bin/python3.13 /opt/br/bin/python \
+       || ( echo "keeping the image interpreter" >&2; rm -rf /opt/python; ln -s /usr/local/bin/python3.13 /opt/br/bin/python ) ) \
+    && rm -rf /tmp/build
+ENV PATH=/opt/br/bin:/usr/local/bin:/usr/local/sbin:/usr/sbin:/usr/bin:/sbin:/bin
+
+# 1. third-party packages (PyPI only, exact versions, no dependency resolution)
 COPY requirements.txt /tmp/requirements.txt
-RUN pip install --no-cache-dir --no-deps --no-compile --disable-pip-version-check \
-        --root-user-action=ignore -r /tmp/requirements.txt \
+RUN python -m pip install --no-cache-dir --no-deps --no-compile --disable-pip-version-check --root-user-action=ignore \
+        -r /tmp/requirements.txt \
     && rm /tmp/requirements.txt
 
-# --- sqlglot source at the pinned commit (GitHub tarball, verified by tree digest) -------------
-COPY setup/fetch_sqlglot.py /tmp/fetch_sqlglot.py
-RUN python /tmp/fetch_sqlglot.py /repo b5e23dd1faff7c2a14ef374d02be8bab60c9343d6d3140690cbad12dbcc7764e \
+# 2. sqlglot at the pinned commit (GitHub archive of sqlglot's own repo; no git, no apt)
+COPY build/fetch_sqlglot.py /tmp/fetch_sqlglot.py
+RUN /usr/local/bin/python3.13 /tmp/fetch_sqlglot.py /repo b5e23dd1faff7c2a14ef374d02be8bab60c9343d6d3140690cbad12dbcc7764e \
     && rm /tmp/fetch_sqlglot.py
 
-# --- Precompiled bytecode -----------------------------------------------------------------------
-# The run filesystem is read-only, so every importable file (stdlib, site-packages, sqlglot and
-# its tests) gets an unchecked-hash .pyc now. The slim image ships the stdlib without .pyc files,
-# and pip's own .pyc files are timestamp-based, hence -f.
-RUN python -m compileall -f -q -j 0 --invalidation-mode unchecked-hash /usr/local/lib/python3.13 /repo \
-    && chmod -R a+rX /repo /usr/local/lib/python3.13
+# 3. bytecode for everything that can be imported (stdlib, site-packages, sqlglot, tests), as
+#    unchecked-hash pycs: the run disk is read-only, so nothing may be compiled or stat-checked there.
+#    Neither interpreter ships usable stdlib pycs; pip's own pycs are timestamp-based (-f redoes them).
+#    Left out, to keep the build short: folders that no run imports (the test suites of the
+#    standard library, numpy and pandas, pip, and the GUI / demo packages).
+RUN STDLIB=$(python -c "import sysconfig; print(sysconfig.get_path('stdlib'))") \
+    && python -m compileall -f -q -j 4 --invalidation-mode unchecked-hash \
+         -x '/lib/python3[.]13/(test|idlelib|tkinter|turtledemo|lib2to3|ensurepip)/|/site-packages/(pandas|numpy)/(.*/)?tests/|/site-packages/pip/' \
+         "$STDLIB" /repo \
+    && find /repo /opt "$STDLIB" \( -type d ! -perm -005 -o -type f ! -perm -004 \) -exec chmod a+rX {} +
 
-# --- Interpreter settings for the scored run ----------------------------------------------------
-# A fixed hash seed (the saved base state depends on it) and mimalloc with large pages
-# (cheaper fork, exit and page faults; harmless where the host has transparent huge pages off).
+# CPU settings for the run (see the selector notes): a fixed hash seed (the saved base state of
+# the import fingerprint depends on it) and mimalloc with transparent huge pages (cheaper fork,
+# exit and page faults; no effect where the host has THP off).
 ENV PYTHONHASHSEED=0 \
     PYTHONMALLOC=mimalloc \
     MIMALLOC_LARGE_OS_PAGES=1 \
@@ -43,33 +59,49 @@ ENV PYTHONHASHSEED=0 \
     MIMALLOC_ARENA_EAGER_COMMIT=1 \
     MIMALLOC_PURGE_DELAY=-1
 
-# --- Static prefilter ---------------------------------------------------------------------------
-# Runs first (predictor/start.py launches it); the predictor keeps only tests both sides select.
-# Its indexes over the pinned tree are generated here into /prefilter/generated.
-COPY prefilter /prefilter
-RUN mkdir -p /prefilter/generated \
-    && python /prefilter/build/instruction_map.py /repo /prefilter/generated/instructions.gz \
-    && python /prefilter/build/refs_index.py /repo /prefilter/generated/refs.json.gz \
-    && python /prefilter/build/test_readers.py /repo /prefilter/generated/metadata-readers.json /prefilter/generated/frame-readers.json \
-    && python /prefilter/build/fixture_fields.py /repo /prefilter/data/coverage.json.gz > /prefilter/generated/fixture-fields.json \
-    && python /prefilter/build/frame_scope.py /repo > /prefilter/generated/frame-scope.json \
-    && python /prefilter/build/default_flow.py /repo > /prefilter/generated/default-flow.json \
-    && (python /prefilter/build/tpcds_stages.py /repo /prefilter/generated/tpcds-stages.json || echo "tpcds stage gate off" >&2) \
-    && python -m compileall -f -q --invalidation-mode unchecked-hash /prefilter \
-    && chmod -R a+rX /prefilter
+# 4a. The static selector and its maps (launch_selection.py runs it first; the pipeline keeps
+#     only the tests that both select). Its build-time indexes are derived from the pinned tree.
+#     mapcache.py then stores a marshal copy of each gzip JSON map (same objects, read faster);
+#     without them the selector reads the gzip files as before.
+COPY screen /screen
+RUN python /screen/instruction_map.py /repo /screen/instructions.gz \
+    && python /screen/refs_index.py /repo /screen/refs.json.gz \
+    && python -c "import json,pathlib; r=pathlib.Path('/repo'); print(json.dumps([p.relative_to(r).as_posix() for p in (r/'tests').rglob('*.py') if 'expression_metadata' in p.read_text().lower()]))" > /screen/metadata-readers.json \
+    && python -c "import json,pathlib,re; r=pathlib.Path('/repo'); patterns={'documentation_readers':r'__doc__|getdoc|doctest|pydoc|help[(]','memory_readers':r'tracemalloc','frame_readers':r'__code__|co_varnames|f_locals|currentframe|_getframe|settrace|setprofile|inspect[.]|dis[.]'}; print(json.dumps({p.relative_to(r).as_posix():[k for k,v in patterns.items() if re.search(v,p.read_text())] for p in (r/'tests').rglob('*.py')}))" > /screen/frame-readers.json \
+    && python /screen/fixture_fields.py /repo /screen/coverage.json.gz > /screen/fixture-fields.json \
+    && python /screen/frame_scope.py /repo > /screen/frame-scope.json \
+    && python /screen/default_flow.py /repo > /screen/default-flow.json \
+    && (python /screen/mapcache.py /screen || echo "screen maps stay gzip JSON" >&2) \
+    && python -m compileall -f -q --invalidation-mode unchecked-hash /screen \
+    && chmod -R a+rX /screen
 
-# --- Dynamic predictor (last, so code changes rebuild only this layer) --------------------------
-# The TestExecutor row cache is built from the pinned csv files and verified against the real
-# setUpClass; if verification fails the cache is dropped and setUpClass runs at test time.
-# The base-state snapshot is optional too: without it the predictor computes it on the fly.
-COPY predictor /predictor
-RUN (python /predictor/build/executor_rows.py /repo /predictor/cache --check \
-     || (echo "exec cache check failed; running without it" >&2; rm -rf /predictor/cache)) \
-    && mkdir -p /predictor/cache \
-    && (python /predictor/build/base_state.py /repo /predictor/cache/base_state.bin \
-     || (echo "no saved base state; the predictor computes it" >&2; rm -f /predictor/cache/base_state.bin)) \
-    && python -m compileall -f -q --invalidation-mode unchecked-hash /predictor \
-    && chmod -R a+rX /predictor
+# 4. our program and maps (last, so that a code change rebuilds only this). The TestExecutor row
+#    cache (preload.py) is built from the pinned csv files and checked against the real
+#    setUpClass; if the check fails, the cache is removed and the selector runs setUpClass as before.
+#    DuckDB's answers to the SQL texts of the pinned tests are recorded too (build_duck_replay.py,
+#    duckreplay.py): a test that sends a recorded text gets the recorded answer, any other text
+#    runs in DuckDB. If the recording or its rehearsal fails, every query runs as before.
+#    Two more facts of the pinned tree are prepared here: whether any test file reads docstrings
+#    (build_docs_read.py; the selector otherwise reads all test files to find out), and the map
+#    files are stored without zlib compression (rawmaps.py; rawz.py reads both forms, and every
+#    converted file is read back and compared). If a step fails, the selector works as before.
+COPY app /app
+# The step memo of the stage check of test_execute_tpcds (build_memo.py, memo.py): the outputs of
+# the executor steps of every TPC-DS query on the pinned commit. If it fails, the check runs as before.
+RUN (cd /repo && SKIP_INTEGRATION=0 timeout 150 python /app/build_memo.py /repo /app/maps/stages.bin /app/maps 4) \
+    || (echo "no step memo" >&2; rm -f /app/maps/memo.bin /app/maps/memo.dat)
+RUN (timeout 120 python /app/build_exec_cache.py /repo /app/cache --check \
+     || (echo "exec cache check failed; running without it" >&2; rm -rf /app/cache)) \
+    && mkdir -p /app/cache \
+    && (timeout 240 python /app/build_duck_replay.py /repo /app/cache/duck_replay.bin --check \
+     || (echo "no DuckDB answer recording; every query runs" >&2; rm -f /app/cache/duck_replay.bin)) \
+    && (python /app/build_base_state.py /repo /app/cache/base_state.bin \
+     || (echo "no saved base state; the selector computes it" >&2; rm -f /app/cache/base_state.bin)) \
+    && (python /app/build_docs_read.py /repo /app/maps /app/cache/docs_read.json \
+     || (echo "no saved docs answer; the selector reads the test files" >&2; rm -f /app/cache/docs_read.json)) \
+    && (python /app/rawmaps.py /app/maps || echo "maps stay compressed" >&2) \
+    && python -m compileall -f -q --invalidation-mode unchecked-hash /app \
+    && chmod -R a+rX /app
 
 WORKDIR /repo
-CMD ["python", "/predictor/start.py"]
+CMD ["python", "/app/launch.py"]
