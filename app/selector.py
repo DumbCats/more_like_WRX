@@ -202,7 +202,7 @@ PRE_KEEPS = os.environ.get("BR_PRE_KEEPS", "1") == "1"  # reduced test code comp
 CONE_HOLDER = os.environ.get("BR_CONE_HOLDER", "1")
 # Holders that give the fresh commits the preimported libraries when a fresh commit of the batch
 # changes a test module (preimport_left_out in run). BR_HOLDER_PREIMPORT=0 turns them off.
-HOLDER_PREIMPORT = os.environ.get("BR_HOLDER_PREIMPORT", "1") == "1"
+HOLDER_PREIMPORT = os.environ.get("BR_HOLDER_PREIMPORT", "0") == "1"
 HOLDER_PREIMPORT_MIN = int(os.environ.get("BR_HOLDER_PREIMPORT_MIN", "2"))  # fresh commits at least
 
 
