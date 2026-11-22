@@ -103,5 +103,8 @@ RUN (timeout 120 python /app/build_exec_cache.py /repo /app/cache --check \
     && python -m compileall -f -q --invalidation-mode unchecked-hash /app \
     && chmod -R a+rX /app
 
+# DIAGNOSTIC PROBE (not an entry): stop after planning, so the answer is the static selector's
+# and no test runs; measures what the board charges for the static part.
+ENV BR_PLAN_ONLY=/tmp/plans.json
 WORKDIR /repo
 CMD ["python", "/app/launch.py"]
