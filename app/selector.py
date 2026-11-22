@@ -131,6 +131,9 @@ STOP_AT_COLLECTION = os.environ.get("BR_STOP_AT_COLLECTION", "1") == "1"
 # BR_COLLECTION=all (default): such a commit gets every test instead, which holds the failing tests
 # whether the labels stop at the collection error or also count the tests that fail when they run.
 COLLECTION_ALL = os.environ.get("BR_COLLECTION", "all") == "all"
+# With both rules above, a child that sees a test file fail to import ends before its test runs:
+# finish() selects every test for such a commit anyway. BR_COLLECTION_SKIP=0 turns it off.
+COLLECTION_SKIP = os.environ.get("BR_COLLECTION_SKIP", "1") == "1"
 RESTRICT = None  # commit -> tests.json numbers that the static selector keeps (launch.py)
 SCREEN_CUT = os.environ.get("BR_SCREEN_CUT", "1") == "1"  # no run of a test that the static selector leaves out (choose)
 SCREEN_SKIP = os.environ.get("BR_SCREEN_SKIP", "1") == "1"  # no runs for a commit whose static answer is empty
@@ -195,6 +198,10 @@ FIXTURE_BATCH_MIN = 2  # commits in one shared child at least
 PRE_KEEPS = os.environ.get("BR_PRE_KEEPS", "1") == "1"  # reduced test code compiled in the parent (prepare_keeps)
 # cone commits under a holder process (cone_in_holder): 0 off, 1 when it pays, 2 always
 CONE_HOLDER = os.environ.get("BR_CONE_HOLDER", "1")
+# Holders that give the fresh commits the preimported libraries when a fresh commit of the batch
+# changes a test module (preimport_left_out in run). BR_HOLDER_PREIMPORT=0 turns them off.
+HOLDER_PREIMPORT = os.environ.get("BR_HOLDER_PREIMPORT", "1") == "1"
+HOLDER_PREIMPORT_MIN = int(os.environ.get("BR_HOLDER_PREIMPORT_MIN", "2"))  # fresh commits at least
 
 
 def _holder_pays():
@@ -2635,7 +2642,7 @@ def preimport_for_fresh(fresh, plans, tests):
     import importlib
 
     if any(p.startswith("tests/") and p.endswith(".py") for c in fresh for p in plans[c].files):
-        return
+        return False
     before = list(sys.path)
     for name in TEST_LIBRARIES:
         try:
@@ -2652,6 +2659,7 @@ def preimport_for_fresh(fresh, plans, tests):
             except Exception:  # noqa: BLE001
                 pass
     gc.freeze()
+    return True
 
 
 def run_added_tests(added, wfd):
@@ -3292,6 +3300,16 @@ def child_main(plan: Plan, order, tests, wfd, index, skip_after_fail, plan_fd=No
                     if n in dead:
                         emit(n, True)
                 order = [n for n in order if n not in dead]
+            if (COLLECTION_SKIP and STOP_AT_COLLECTION and COLLECTION_ALL and not RUN_ALL and not plan.watch
+                    and not plan.all_fail and "import does not end" not in plan.note):
+                # A test file of the patched tree does not import (broken_here holds only the
+                # "B" names here: the "K" names of class fixtures come later, in hot mode
+                # only). finish() then selects every test (collection stops) when this child
+                # reports END, whatever the verdicts: no run can change that answer.
+                files = {t["file"] for t in tests}
+                if any(name.replace(".", "/") + ".py" in files for name in broken_here):
+                    os.write(wfd, b"END\n")
+                    os._exit(0)
         else:
             for full, pairs in plan.work:
                 swaps = engine.plan_swaps(pairs, index)
@@ -5654,8 +5672,17 @@ def run(t_start, deadline, state):
     def preimport_once():
         # the libraries and the code of the test modules, for the children of import-time commits
         if not preimported and len(fresh) >= 2 and os.environ.get("BR_NO_PREIMPORT") != "1":
-            preimported.append(True)
-            preimport_for_fresh(fresh, plans, tests)
+            preimported.append(preimport_for_fresh(fresh, plans, tests))
+
+    def changes_tests(c):
+        return any(p.startswith("tests/") and p.endswith(".py") for p in plans[c].files)
+
+    def preimport_left_out():
+        """True when preimport_once left the libraries out because a fresh commit changes a
+        test module. The other fresh commits can still get them, in a holder process
+        (cone_in_holder, fresh_in_holder): the commits that change a test module run here,
+        in this process, which never imports them."""
+        return preimported == [False] and HOLDER_PREIMPORT
 
     # 2a. Import-time commits whose patched modules have a small importer cone (cone.py) run
     #     now, while this process holds the pinned import of sqlglot and no test module: their
@@ -5705,7 +5732,7 @@ def run(t_start, deadline, state):
                 done.add(c)
         return done
 
-    def cone_in_holder(todo):
+    def cone_in_holder(todo, pre=False):
         """Runs cone_loop(todo) in a forked holder process, while this process waits without
         running any Python code. Why: the work of this process while a child lives (the
         import-state comparison of each cone commit) writes to memory that it shares with
@@ -5725,6 +5752,8 @@ def run(t_start, deadline, state):
             try:
                 os.close(r)
                 pin_carry(cpu_before)
+                if pre:
+                    preimport_for_fresh(todo, plans, tests)
                 done = cone_loop(todo)
                 out = {"done": {c: answers[c] for c in done if c in answers},
                        "redo": [c for c in todo if c not in done]}
@@ -5783,12 +5812,17 @@ def run(t_start, deadline, state):
             plans[c].mode = "fresh"
         return done, redo
 
-    if cone_first and _holder_pays():
+    # the cone commits get the preimported libraries in a holder, when this process leaves
+    # them out (a later fresh commit changes a test module); not when the holder path's own
+    # handling of numpy and pandas (below) would differ from cone_loop's in this process
+    cone_pre = bool(cone_first) and preimport_left_out() and pandas_turn not in cone_first \
+        and not any(changes_tests(c) for c in cone_first)
+    if cone_first and (_holder_pays() or cone_pre):
         if pandas_turn in cone_first and any(needs_pandas(c) for c in hot + [f for f in fresh if f not in set(cone_first)]):
             # numpy and pandas are needed after the cone step too: loaded here, once, before
             # the holder starts (it inherits them)
             load_pandas_here()
-        held_done, held_redo = cone_in_holder(cone_first)
+        held_done, held_redo = cone_in_holder(cone_first, cone_pre)
         cone_done |= held_done
         rest = [c for c in cone_first if c not in held_done and c not in held_redo]
         if pandas_turn in cone_first and not pandas_here:
@@ -5930,10 +5964,94 @@ def run(t_start, deadline, state):
                     plan.cands.update(maps.tests(rec[7]))
                     plan.cands.update(maps.tests(rec[8]))
             plan.keeps = {n: k for n, k in plan.keeps.items() if k[4] is None}
+    def fresh_in_holder(todo, purge):
+        """The fresh commits of todo (none changes a test module), in a forked holder that
+        first imports the test modules' libraries (preimport_for_fresh), so that their
+        children need not. The holder walks the fresh commits in their order and loads numpy
+        and pandas at pandas_turn, as the loop below does: each commit of todo runs from the
+        same state as there, plus the preimport. Returns the commits that the holder ran
+        (their answers are filled in here); the others run in this process."""
+        want = set(todo)
+        r, w = os.pipe()
+        cpu_before = sum(os.times()[:4])
+        pid = os.fork()
+        if pid == 0:
+            try:
+                os.close(r)
+                pin_carry(cpu_before)
+                preimport_for_fresh(todo, plans, tests)
+                ran = []
+                for c in fresh:
+                    if c == pandas_turn:
+                        load_pandas_here()
+                    if c not in want:
+                        continue
+                    plan = plans[c]
+                    plan.mode = "fresh_purge" if purge else "fresh"
+                    execute_safe(c, plan, None)
+                    ran.append(c)
+                out = {"ran": ran, "done": {c: answers[c] for c in ran if c in answers}}
+                if DEBUG:
+                    out["debug"] = json.dumps({c: debug_rows[c] for c in ran if c in debug_rows})
+                data = marshal.dumps(out)
+                while data:
+                    data = data[os.write(w, data):]
+            except BaseException as e:  # noqa: BLE001
+                try:
+                    log("fresh holder failed", repr(e))
+                except BaseException:  # noqa: BLE001
+                    pass
+            finally:
+                os._exit(0)
+        os.close(w)
+        chunks = []
+        try:
+            while True:
+                left = deadline - time.monotonic() - 5.0
+                if left <= 0:
+                    break
+                ready, _, _ = select.select([r], [], [], left)
+                if not ready:
+                    break
+                chunk = os.read(r, 1 << 16)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+        finally:
+            os.close(r)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            os.waitpid(pid, 0)
+            try:
+                while os.waitpid(-1, os.WNOHANG)[0] > 0:
+                    pass
+            except ChildProcessError:
+                pass
+        try:
+            out = marshal.loads(b"".join(chunks))
+        except (EOFError, ValueError, TypeError):
+            log("fresh holder: no report")
+            return set()
+        for c, workers in out["done"].items():
+            answers[c] = workers
+        if DEBUG and "debug" in out:
+            debug_rows.update(json.loads(out["debug"]))
+        log("fresh holder:", len(todo), "commits,", len(out["ran"]), "ran")
+        return set(out["ran"])
+
     preimport_once()
+    held_fresh = set()
+    if preimport_left_out():
+        todo = [c for c in fresh if not changes_tests(c)]
+        if len(todo) >= HOLDER_PREIMPORT_MIN:
+            held_fresh = fresh_in_holder(todo, purge)
     for c in fresh:
         if c == pandas_turn:
             load_pandas_here()
+        if c in held_fresh:
+            continue
         plan = plans[c]
         plan.mode = "fresh_purge" if purge else "fresh"
         execute_safe(c, plan, None)
