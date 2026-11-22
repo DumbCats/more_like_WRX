@@ -16,7 +16,12 @@ import urllib.request
 
 TAG = "20261110"
 NAME = "cpython-3.13.18+20261110-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
-URL = "https://github.com/astral-sh/python-build-standalone/releases/download/%s/%s" % (TAG, NAME.replace("+", "%2B"))
+# The same release file from two hosts (GitHub, and the mirror that the uv installer also uses); a
+# download from either must have the sha256 below, so the order only matters for availability.
+URLS = [
+    "https://github.com/astral-sh/python-build-standalone/releases/download/%s/%s" % (TAG, NAME.replace("+", "%2B")),
+    "https://releases.astral.sh/github/python-build-standalone/releases/download/%s/%s" % (TAG, NAME.replace("+", "%2B")),
+]
 SHA256 = "f2d2199eb25880e07863b391cf7124e7ffa1338b0d65600dfcec117c4223a7fb"
 DEST = sys.argv[1] if len(sys.argv) > 1 else "/opt"
 
@@ -34,15 +39,18 @@ def download():
         left = deadline - time.monotonic()
         if left <= 5:
             break
+        url = URLS[(attempt - 1) % len(URLS)]  # the hosts take turns: one being down does not use up all attempts
         try:
-            with urllib.request.urlopen(URL, timeout=min(60.0, left)) as r:
+            # (the mirror answers 403 to urllib's default User-Agent)
+            request = urllib.request.Request(url, headers={"User-Agent": "build-fetch/1.0"})
+            with urllib.request.urlopen(request, timeout=min(60.0, left)) as r:
                 data = r.read()
             digest = hashlib.sha256(data).hexdigest()
             if digest == SHA256:
                 return data
-            print(f"download attempt {attempt}: sha256 {digest} ({len(data)} bytes), want {SHA256}", file=sys.stderr)
+            print(f"download attempt {attempt} ({url.split('/')[2]}): sha256 {digest} ({len(data)} bytes), want {SHA256}", file=sys.stderr)
         except Exception as e:  # noqa: BLE001
-            print(f"download attempt {attempt} failed: {e!r}", file=sys.stderr)
+            print(f"download attempt {attempt} ({url.split('/')[2]}) failed: {e!r}", file=sys.stderr)
         time.sleep(min(pause, max(0.0, deadline - time.monotonic())))
         pause = min(pause * 2, 20.0)
     return None
