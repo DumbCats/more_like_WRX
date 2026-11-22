@@ -54,6 +54,7 @@ RUN mkdir -p /prefilter/generated \
     && python /prefilter/build/fixture_fields.py /repo /prefilter/data/coverage.json.gz > /prefilter/generated/fixture-fields.json \
     && python /prefilter/build/frame_scope.py /repo > /prefilter/generated/frame-scope.json \
     && python /prefilter/build/default_flow.py /repo > /prefilter/generated/default-flow.json \
+    && (python /prefilter/build/tpcds_stages.py /repo /prefilter/generated/tpcds-stages.json || echo "tpcds stage gate off" >&2) \
     && python -m compileall -f -q --invalidation-mode unchecked-hash /prefilter \
     && chmod -R a+rX /prefilter
 

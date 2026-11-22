@@ -20,13 +20,15 @@ PREFILTER_SECONDS = float(os.environ.get('BLAST_PREFILTER_SECONDS', '60'))
 def prefilter_environment():
     """The prefilter's environment: ours plus defaults for the knobs it reads.
 
-    Its replay and TPC-DS budgets default to 0 (off).
+    Its replay and TPC-DS budgets default to 0 (off): the TPC-DS stage gate runs on the final
+    answers instead (coordinator.tpcds_gate).
     """
     environment = dict(os.environ)
     environment.setdefault('BLAST_REPO', '/repo')
     environment.setdefault('BLAST_DATA', '/data')
     environment.setdefault('BLAST_PREFILTER_REPLAY_BUDGET', '0')
     environment.setdefault('BLAST_PREFILTER_TPCDS_BUDGET', '0')
+    environment.setdefault('BLAST_PREFILTER_FULL_REPLAY', '0')
     return environment
 
 

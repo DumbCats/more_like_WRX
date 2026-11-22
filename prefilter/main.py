@@ -9,12 +9,13 @@ import json
 import os
 
 import tpcds_profile
+import tpcds_stages
 from diff_reader import file_edits
 from file_masks import mask_for_file
 from fixtures import fixture_structure_mask
 from refinement import drop_tpcds, narrow_with_replay
 from scheduling import schedule, schedule_with_margin
-from settings import REPLAY_BUDGET_DEFAULT, REPLAY_BUDGET_VARIABLE, SHIPPED_DIR, TASK_DATA, TPCDS_BUDGET_DEFAULT, TPCDS_BUDGET_VARIABLE
+from settings import GENERATED_DIR, REPLAY_BUDGET_DEFAULT, REPLAY_BUDGET_VARIABLE, SHIPPED_DIR, TASK_DATA, TPCDS_BUDGET_DEFAULT, TPCDS_BUDGET_VARIABLE
 from tables import load_tables
 
 
@@ -65,6 +66,7 @@ def main(printed):
     duration = {number: ms for _bit, (ms, number) in numbered}
     test_ids = {test['number']: test['id'] for test in tests}
     maps['tpcds'] = tpcds_profile.load(SHIPPED_DIR / 'tpcds.gz')
+    maps['tpcds_stages'] = tpcds_stages.load(GENERATED_DIR / 'tpcds-stages.json')
     tpcds_id = maps['tpcds']['test'] if maps['tpcds'] else None
     tpcds_bit = 1 << index[tpcds_id] if tpcds_id in index and any(test['id'] == tpcds_id for test in tests) else 0
     if maps['tpcds'] and maps['tpcds']['count'] != len(maps['tpcds']['cpu']):

@@ -58,12 +58,16 @@ HOLD_FACTOR = float(os.environ.get('BLAST_HOLD_FACTOR', '0.7'))
 COMMIT_SECONDS = float(os.environ.get('BLAST_COMMIT', '8.0'))
 FRESH_SECONDS = float(os.environ.get('BLAST_FRESH', '3.0'))
 QUIET_HOLD_SECONDS = float(os.environ.get('BLAST_QUIET_HOLD', '5.0'))
+TPCDS_GATE_SECONDS = float(os.environ.get('BLAST_TPCDS_GATE', '40'))       # wall seconds for the final TPC-DS stage gate
 AFTER_FAIL_RATIO = float(os.environ.get('BLAST_AFTER_FAIL', '0.5'))
 SLOWDOWN = float(os.environ.get('BLAST_SLOWDOWN', '1.0'))
 CLASS_SETUP_SECONDS = {'tests/test_executor.py::TestExecutor': 1.0} if os.environ.get('BLAST_CLASS_SETUP', '1') == '1' else {}
 INERT_SECONDS = 1.0
 WORKER_COST = 2.0
 TEST_TIMEOUT = 4.0
+# a run may take this many times its estimated cost (passing runs stay under 4x; a timeout
+# only means the test is selected)
+TIMEOUT_FACTOR = float(os.environ.get('BLAST_TIMEOUT_FACTOR', '6.0'))
 SETUP_TIMEOUT = 6.0
 TOKEN_CHECK_SECONDS = 2.0
 MANY_FAILURES = 8

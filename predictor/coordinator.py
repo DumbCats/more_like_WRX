@@ -65,6 +65,7 @@ def main():
     extra_tests = outputs.get('extra') or []
     every_test = None
     lines = []
+    final = {}
     for commit in commits:
         workers = outputs['answers'].get(commit)
         if workers is None:
@@ -82,7 +83,16 @@ def main():
             workers = [worker for worker in workers if worker]
         if extra_tests:
             workers = [workers[0] + extra_tests] + workers[1:] if workers else [list(extra_tests)]
-        lines.append(json.dumps({'commit': commit, 'workers': workers}))
+        final[commit] = workers
+    dropped = tpcds_gate(final, tests, deadline)
+    if dropped:
+        tpcds_number = commit_test_number(tests)
+        by_number = {test['number']: test['seconds'] for test in tests}
+        for commit in dropped:
+            final[commit] = pack(sorted(number for worker in final[commit] for number in worker if number != tpcds_number), by_number)
+        log('tpcds gate dropped the TPC-DS test from', len(dropped), 'commits')
+    for commit in commits:
+        lines.append(json.dumps({'commit': commit, 'workers': final[commit]}))
     data = ('\n'.join(lines) + '\n').encode() if lines else b''
     while data:
         written = os.write(answer_fd, data)
@@ -96,6 +106,53 @@ def main():
     log('done in', round(time.monotonic() - started_at, 2), 's wall; cpu', round(sum(os.times()[:4]), 2), cgroup_cpu)
     sys.stderr.flush()
     os._exit(0)
+
+
+TPCDS_TEST = 'tests/test_executor.py::TestExecutor::test_execute_tpcds'
+
+
+def commit_test_number(tests):
+    """The number of the TPC-DS executor test in tests.json (None when absent)."""
+    return next((test['number'] for test in tests if test['id'] == TPCDS_TEST), None)
+
+
+def tpcds_gate(final, tests, deadline):
+    """Commits whose final answer may drop the TPC-DS executor test (the prefilter's stage gate,
+    run as a fresh process on what is left of the wall budget, says it still passes)."""
+    number = commit_test_number(tests)
+    budget = min(settings.TPCDS_GATE_SECONDS, deadline - time.monotonic() - 10.0)
+    gate = os.path.join(os.path.dirname(os.environ.get('BLAST_PREFILTER', '/prefilter/main.py')), 'tpcds_gate.py')
+    if number is None or budget < 3.0 or not os.path.exists(gate):
+        return []
+    seconds = {test['number']: test['seconds'] for test in tests}
+
+    def cost(workers):
+        return max((sum(seconds[test] for test in worker) for worker in workers), default=0.0) + settings.WORKER_COST * len(workers)
+
+    # Other executor tests in the answer (failing or held) almost always mean the TPC-DS test
+    # fails too: the TPC-H ones, or two or more of the rest. The gate is not worth its CPU there.
+    executor_ids = {test['number']: test['id'] for test in tests if test['id'].startswith(TPCDS_TEST.rsplit('::', 1)[0] + '::')}
+    savings = {}
+    for commit, workers in final.items():
+        chosen = [test for worker in workers for test in worker]
+        others = [executor_ids[test] for test in chosen if test in executor_ids and test != number]
+        if any(test_id.endswith(('::test_execute_tpch', '::test_optimized_tpch')) for test_id in others) or len(others) >= 2:
+            continue
+        if number in chosen:
+            savings[commit] = round(cost(workers) - cost(pack(sorted(test for test in chosen if test != number), seconds)), 3)
+    savings = {commit: saving for commit, saving in savings.items() if saving > 5.0}
+    if not savings:
+        return []
+    import subprocess
+
+    environment = dict(os.environ, BLAST_REPO=settings.REPO, BLAST_DATA=settings.DATA)
+    try:
+        completed = subprocess.run([sys.executable, gate, str(budget)], input=json.dumps(savings).encode(), stdout=subprocess.PIPE, timeout=budget + 15.0, env=environment)
+        verdicts = [json.loads(line) for line in completed.stdout.decode().splitlines() if line.strip()]
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        log('tpcds gate failed:', repr(error))
+        return []
+    return [row['commit'] for row in verdicts if row.get('verdict') == 'pass' and row.get('commit') in savings]
 
 
 def _commit_names():

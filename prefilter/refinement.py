@@ -5,15 +5,24 @@ test when they all still pass; narrow_with_replay runs cheap unit tests on the p
 sources and keeps only the failing ones. The replay modules (multiprocessing, unittest, ...)
 are imported only when a budget is actually spent, before its clock starts.
 """
+import os
 import sys
 import time
 
 import tpcds_profile
+import tpcds_stages
 from scheduling import mask_cost, plan_milliseconds, schedule, schedule_with_margin
 from settings import REPO
 
 TPCDS_OVERHEAD = 3.0
 TPCDS_SLOWDOWN = 1.3
+# Stage gate (tpcds_stages), measured CPU seconds: a safe check (re-import, parse/optimize/
+# transpile, a few executions), the fixed part of a full check (re-import, parse/transpile,
+# pickled tables) on top of the profiled executions; and the share of the selection saving the
+# gate may cost (most selections that keep the test are right, and failing checks are cheap).
+SAFE_STAGE_SECONDS = 4.0
+FULL_STAGE_OVERHEAD = 1.0
+STAGE_GAIN_RATIO = 0.6
 # Test id prefixes whose tests can run under plain unittest in the replay child.
 REPLAYABLE = (
     'tests/dialects/',
@@ -42,6 +51,22 @@ def drop_tpcds(mask, files, skipped, file_masks, maps, numbered, duration, bit, 
     profile = maps['tpcds']
     if any(file_masks.get(path, bit) & bit for path in skipped):
         return mask, left
+    gain = (mask_cost(mask, numbered, duration) - mask_cost(mask & ~bit, numbered, duration)) / 1000
+    stages = maps.get('tpcds_stages')
+    if stages and not skipped:
+        safe = tpcds_stages.downstream_safe(files, stages)
+        estimate = SAFE_STAGE_SECONDS if safe else FULL_STAGE_OVERHEAD + sum(stages['cpu'])
+        if estimate <= STAGE_GAIN_RATIO * gain and estimate <= left and all(path.startswith('sqlglot/') and path.endswith('.py') for path, *_rest in files):
+            started = time.monotonic()
+            verdict, executed = tpcds_stages.still_passes(REPO, files, stages, safe, stages['cpu'], min(left, 2 * estimate + 3), stages.get('tables'))
+            left -= time.monotonic() - started
+            print(f"tpcds stages ({'safe' if safe else 'full'}): {verdict}, {executed} executed", file=sys.stderr)
+            if verdict == 'pass':
+                return mask & ~bit, left
+            if verdict == 'fail':
+                return mask, left
+    if os.environ.get('BLAST_PREFILTER_FULL_REPLAY', '1') != '1':
+        return mask, left
     found = tpcds_profile.affected_queries(profile, files, file_masks, bit)
     if found is not None and not found[0]:
         found = tpcds_profile.affected_queries(profile, files, file_masks, bit, granular=False)
@@ -50,7 +75,6 @@ def drop_tpcds(mask, files, skipped, file_masks, maps, numbered, duration, bit, 
     queries, reached = found
     order = [query for query in range(profile['count']) if queries >> query & 1]
     estimate = TPCDS_OVERHEAD + TPCDS_SLOWDOWN * sum(profile['cpu'][query] for query in order)
-    gain = (mask_cost(mask, numbered, duration) - mask_cost(mask & ~bit, numbered, duration)) / 1000
     if estimate > gain / 2 or estimate > left:
         return mask, left
     import tpcds_replay

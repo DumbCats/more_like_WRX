@@ -239,7 +239,7 @@ class Scheduler:
                 plan.must_select.update(plan.token_checks)
                 plan.notes.append('watch: token stream check not run, %s selected' % plan.token_checks)
                 plan.token_checks = []
-        allowed = {number: max(settings.TEST_TIMEOUT, 25.0 * cost[number]) * settings.SLOWDOWN for number in ran}
+        allowed = {number: max(settings.TEST_TIMEOUT, settings.TIMEOUT_FACTOR * cost[number]) * settings.SLOWDOWN for number in ran}
         skip_after_fail = set() if settings.RUN_ALL or plan.watch_specs else {number for number in ran if cost[number] > max(0.03, settings.AFTER_FAIL_RATIO * seconds[number]) and number not in plan.protected}
         plan.enders = {}
         long_held = [number for number in held if seconds[number] > settings.QUIET_HOLD_SECONDS]

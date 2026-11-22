@@ -200,9 +200,18 @@ def lambda_edit(path, before, after, maps):
     for old, _new in changed:
         if any(func.lineno <= old.lineno <= func.end_lineno for func in functions):
             return None
+        reached = 0
         for number in range(old.lineno, old.end_lineno + 1):
-            key = str(number)
-            mask |= int(line_masks.get(key, '0'), 16) | int(import_masks.get(key, '0'), 16)
+            reached |= int(line_masks.get(str(number), '0'), 16)
+        if not reached:
+            # The profiles miss many lambda bodies (e.g. the executor's ENV table) even though
+            # tests call them, so an unreached lambda falls back to every test that runs any
+            # code of this file.
+            for line_tests in line_masks.values():
+                reached |= int(line_tests, 16)
+        mask |= reached
+        for number in range(old.lineno, old.end_lineno + 1):
+            mask |= int(import_masks.get(str(number), '0'), 16)
     return mask
 
 
