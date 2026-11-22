@@ -361,16 +361,23 @@ def lambda_edit(path, before, after, maps):
     rows = maps["lines"].get(path, {})
     imports = maps["imports"].get(path, {})
     mask = child_mask(path, maps)
+    call_args = {id(arg) for n in ast.walk(before) if isinstance(n, ast.Call) for arg in n.args}
+
+    def wrapped(node):
+        return id(node) in call_args
+
     for old, _ in changed:
         if any(f.lineno <= old.lineno <= f.end_lineno for f in functions):
             return None
         reached = 0
         for line in range(old.lineno, old.end_lineno + 1):
             reached |= int(rows.get(str(line), "0"), 16)
-        if not reached:
-            # The coverage maps miss many lambda bodies that tests do call (e.g. the executor's
-            # ENV table in sqlglot/executor/env.py): a changed lambda with no recorded line falls
-            # back to every test that runs any code of this file.
+        if not reached and wrapped(old):
+            # The coverage maps miss most lambdas passed to a call (52 of 72 at module/class
+            # level, e.g. null_if_any(lambda ...) in the executor's ENV table) although tests do
+            # call them: such a lambda with no recorded line falls back to every test that runs
+            # any code of this file. Plain dict-value lambdas are recorded (1166 of 1491), so an
+            # unrecorded one is taken as never called, as before.
             for tests in rows.values():
                 reached |= int(tests, 16)
         mask |= reached
