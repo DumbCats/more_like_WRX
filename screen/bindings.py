@@ -12,7 +12,7 @@ The edit itself must not be able to fail during import: it may only change
 constants, existing names and attributes inside literal containers.
 """
 import ast
-from tree_equal import same_tree
+from tree_equal import same_tree, select
 import builtins
 import gc
 import gzip
@@ -140,14 +140,16 @@ def _bound_before(body, lineno):
 
 
 def _import_attributes(tree):
+    """Attributes outside function and lambda definitions (their decorators, defaults and
+    annotations included), as (ast.dump of the object, attribute name)."""
     pairs = set()
-    stack = [(tree, False)]
+    stack = [tree]
     while stack:
-        node, deferred = stack.pop()
-        if isinstance(node, ast.Attribute) and not deferred:
+        node = stack.pop()
+        if isinstance(node, ast.Attribute):
             pairs.add((ast.dump(node.value), node.attr))
-        inner = deferred or isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda))
-        stack.extend((child, inner) for child in ast.iter_child_nodes(node))
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            stack.extend(ast.iter_child_nodes(node))
     return pairs
 
 
@@ -336,6 +338,18 @@ def load_refs(maps):
     return maps["refs"]
 
 
+_indexed = []  # [refs, the files its imports and loads name] for the refs index in use
+
+
+def _indexed_files(refs):
+    if not _indexed or _indexed[0] is not refs:
+        files = set(refs["imports"])
+        for entries in refs["loads"].values():
+            files.update(e[0] for e in entries)
+        _indexed[:] = [refs, files]
+    return _indexed[1]
+
+
 def binding_mask(path, before, after, maps):
     changed = _changed_bindings(path, before, after)
     if not changed:
@@ -344,9 +358,7 @@ def binding_mask(path, before, after, maps):
     if not refs:
         return None
     loads, imports, strings, special = refs["loads"], refs["imports"], set(refs["strings"]), refs["special"]
-    files = set(imports) | {path}
-    for entries in loads.values():
-        files.update(e[0] for e in entries)
+    files = _indexed_files(refs) | {path}
     rows_by_file = maps["lines"]
     import_rows = maps["imports"]
     test_files = maps["test_files"]
@@ -453,12 +465,12 @@ def importer_mask(path, maps):
 
 def signature_safe(func, before, after):
     """True when a function's definition-time expressions differ only in ways that cannot raise."""
-    twin = next((n for n in ast.walk(after) if type(n) is type(func) and n.name == func.name
+    twin = next((n for n in select(after, (type(func),)) if type(n) is type(func) and n.name == func.name
                  and n.lineno == func.lineno and n.col_offset == func.col_offset), None)
     if twin is None or (not same_tree(ast.Module(func.decorator_list, []), ast.Module(twin.decorator_list, []))):
         return False
     attributes = _import_attributes(before)
-    names = _bound_before(before.body, 10**9) | {n.id for n in ast.walk(before) if isinstance(n, ast.Name)}
+    names = _bound_before(before.body, 10**9) | {n.id for n in select(before, (ast.Name,))}
     future = any(isinstance(n, ast.ImportFrom) and n.module == "__future__"
                  and any(a.name == "annotations" for a in n.names) for n in before.body)
     olds = [*func.args.defaults, *func.args.kw_defaults]
@@ -499,7 +511,7 @@ def default_callers(func, before, after, path, maps):
     if func.name.startswith("__") or any(
             not (isinstance(d, ast.Name) and d.id in {"staticmethod", "classmethod"}) for d in func.decorator_list):
         return None
-    twin = next((n for n in ast.walk(after) if type(n) is type(func) and n.name == func.name
+    twin = next((n for n in select(after, (type(func),)) if type(n) is type(func) and n.name == func.name
                  and n.lineno == func.lineno and n.col_offset == func.col_offset), None)
     if twin is None:
         return None

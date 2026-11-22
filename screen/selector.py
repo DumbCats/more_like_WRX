@@ -1,6 +1,6 @@
 """Select tests from baseline coverage, fixture reads and syntax changes."""
 import ast
-from tree_equal import same_tree
+from tree_equal import same_tree, select, reset_walks, statement_children
 import bisect
 import gc
 import gzip
@@ -339,13 +339,12 @@ def lambda_edit(path, before, after, maps):
     lines lists every test that executed it. Import-time calls are covered by
     the import trace of each test module and lazily loaded dialect.
     """
-    olds = {(n.lineno, n.col_offset): n for n in ast.walk(before) if isinstance(n, ast.Lambda)}
+    olds = {(n.lineno, n.col_offset): n for n in select(before, (ast.Lambda,))}
     changed = []
-    for new in ast.walk(after):
-        if isinstance(new, ast.Lambda):
-            old = olds.get((new.lineno, new.col_offset))
-            if old is not None and (not same_tree(old, new)):
-                changed.append((old, new))
+    for new in select(after, (ast.Lambda,)):
+        old = olds.get((new.lineno, new.col_offset))
+        if old is not None and (not same_tree(old, new)):
+            changed.append((old, new))
     if not changed:
         return None
     saved = [(new, new.args, new.body) for _, new in changed]
@@ -357,11 +356,11 @@ def lambda_edit(path, before, after, maps):
     finally:
         for new, args, body in saved:
             new.args, new.body = args, body
-    functions = [n for n in ast.walk(before) if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))]
+    functions = select(before, (ast.FunctionDef, ast.AsyncFunctionDef))
     rows = maps["lines"].get(path, {})
     imports = maps["imports"].get(path, {})
     mask = child_mask(path, maps)
-    call_args = {id(arg) for n in ast.walk(before) if isinstance(n, ast.Call) for arg in n.args}
+    call_args = {id(arg) for n in select(before, (ast.Call,)) for arg in n.args}
 
     def wrapped(node):
         return id(node) in call_args
@@ -402,24 +401,29 @@ def equal_without_annotations(before, after):
     if not future_annotations(before) or not future_annotations(after):
         return False
     saved = []
-    for tree in (before, after):
-        for node in ast.walk(tree):
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                saved.append((node, "returns", node.returns))
-                node.returns = None
-                for arg in ast.walk(node.args):
-                    if isinstance(arg, ast.arg):
-                        saved.append((arg, "annotation", arg.annotation))
-                        arg.annotation = None
-                pending = list(node.body)
-                while pending:
-                    inner = pending.pop()
-                    if isinstance(inner, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
-                        continue
-                    if isinstance(inner, ast.AnnAssign):
-                        saved.append((inner, "annotation", inner.annotation))
-                        inner.annotation = ast.Constant(None)
-                    pending.extend(ast.iter_child_nodes(inner))
+    # The functions of both trees, listed before anything changes. The changes below only
+    # replace expressions (returns, argument and local variable annotations), which never
+    # contain a function definition, so a walk during the changes visits the same functions
+    # in the same order. Local annotated assignments are statements, so only the statement
+    # children can lead to one (expressions contain no statements).
+    functions = [select(tree, (ast.FunctionDef, ast.AsyncFunctionDef)) for tree in (before, after)]
+    for found in functions:
+        for node in found:
+            saved.append((node, "returns", node.returns))
+            node.returns = None
+            for arg in ast.walk(node.args):
+                if isinstance(arg, ast.arg):
+                    saved.append((arg, "annotation", arg.annotation))
+                    arg.annotation = None
+            pending = list(node.body)
+            while pending:
+                inner = pending.pop()
+                if isinstance(inner, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+                    continue
+                if isinstance(inner, ast.AnnAssign):
+                    saved.append((inner, "annotation", inner.annotation))
+                    inner.annotation = ast.Constant(None)
+                pending.extend(statement_children(inner))
     try:
         return same_tree(before, after)
     finally:
@@ -511,16 +515,15 @@ def documentation_edit(path, before, after, removed, inserted, maps):
     first = min(removed | inserted)
     # Module, class and function docstrings at any depth. Only doctests and
     # code-object comparisons read them in the pinned suite.
-    candidates = [before] + [n for n in ast.walk(before)
-                             if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
-                             and not n.decorator_list and n.lineno <= first <= n.end_lineno]
+    candidates = [before] + [n for n in select(before, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))
+                             if not n.decorator_list and n.lineno <= first <= n.end_lineno]
     for owner in candidates:
         if not owner.body or not isinstance(owner.body[0], ast.Expr):
             continue
         old = owner.body[0].value
         if not (isinstance(old, ast.Constant) and type(old.value) is str and old.lineno <= first <= old.end_lineno):
             continue
-        twin = after if owner is before else next((n for n in ast.walk(after) if type(n) is type(owner)
+        twin = after if owner is before else next((n for n in select(after, (type(owner),)) if type(n) is type(owner)
                    and n.name == owner.name and n.lineno == owner.lineno
                    and n.col_offset == owner.col_offset), None)
         if twin is None or not twin.body or not isinstance(twin.body[0], ast.Expr):
@@ -597,7 +600,16 @@ def removed_parser_members(path, before, after, removed, maps):
     return None
 
 
-def mask_for_file(path, base, revised, removed, inserted, maps, all_mask, neighbors, isolated=False):
+def mask_for_file(*args, **kwargs):
+    # the cached walks (tree_equal.select) of this file's trees live only during its analysis
+    reset_walks()
+    try:
+        return file_mask(*args, **kwargs)
+    finally:
+        reset_walks()
+
+
+def file_mask(path, base, revised, removed, inserted, maps, all_mask, neighbors, isolated=False):
     readers = int(maps["files"].get(path, "0"), 16)
     if inert(path):
         return readers | int(maps["source_readers"].get(path, "0"), 16)
@@ -659,7 +671,7 @@ def mask_for_file(path, base, revised, removed, inserted, maps, all_mask, neighb
         metadata = metadata_callback_edit(path, before, after, removed, maps)
         if metadata is not None:
             return readers | metadata
-        field_scope = before is scoped_before or any(isinstance(n, ast.ClassDef) for n in ast.walk(scoped_before))
+        field_scope = before is scoped_before or bool(select(scoped_before, (ast.ClassDef,)))
         refs = load_refs(maps) if field_scope and maps.get("flips") else None
         refined = flag_edit(path,before,after,removed,maps,set(refs["strings"]) if refs else None) if refs else None
         if refined is None:
@@ -709,7 +721,7 @@ def mask_for_file(path, base, revised, removed, inserted, maps, all_mask, neighb
 
 def confined(func, before, after):
     """True when the only differences between the trees lie inside func's body."""
-    twin = next((n for n in ast.walk(after) if type(n) is type(func) and n.name == func.name
+    twin = next((n for n in select(after, (type(func),)) if type(n) is type(func) and n.name == func.name
                  and n.lineno == func.lineno and n.col_offset == func.col_offset), None)
     if twin is None:
         return False
@@ -750,7 +762,7 @@ def coverage_mask(path, base, before, after, removed, inserted, maps, all_mask, 
     rows = maps["lines"].get(path, {})
     imports = maps["imports"].get(path, {})
     selected = readers
-    functions = [n for n in ast.walk(scoped_before) if isinstance(n,(ast.FunctionDef, ast.AsyncFunctionDef))]
+    functions = select(scoped_before, (ast.FunctionDef, ast.AsyncFunctionDef))
     source_lines = base.splitlines()
     for number in removed | inserted:
         enclosing = [f for f in functions if f.lineno < number <= f.end_lineno]
@@ -763,8 +775,8 @@ def coverage_mask(path, base, before, after, removed, inserted, maps, all_mask, 
             selected |= importers
             continue
         if not enclosing:
-            classes = sorted((n for n in ast.walk(before) if isinstance(n, ast.ClassDef)
-                              and n.lineno < number <= n.end_lineno), key=lambda n:n.lineno)
+            classes = sorted((n for n in select(before, (ast.ClassDef,))
+                              if n.lineno < number <= n.end_lineno), key=lambda n:n.lineno)
             # Limit a class policy edit to receivers observed in the baseline.
             # A changed class declaration or unknown receiver gets the full suite.
             if classes and number in removed and path.startswith(("sqlglot/dialects/", "sqlglot/parsers/", "sqlglot/generators/", "sqlglot/expressions/")):
@@ -774,7 +786,7 @@ def coverage_mask(path, base, before, after, removed, inserted, maps, all_mask, 
                     # any receiver exists. Include every test in that case.
                     def references(tree):
                         return {(type(n), n.id if isinstance(n,ast.Name) else n.attr)
-                                for n in ast.walk(tree) if isinstance(n,(ast.Name,ast.Attribute))}
+                                for n in select(tree, (ast.Name,ast.Attribute))}
                     if references(after) - references(before):
                         return all_mask
                     owner = ".".join([path[:-3].replace("/", ".")] + [n.name for n in classes])
@@ -951,8 +963,10 @@ def drop_tpcds(mask, files, skipped, file_masks, maps, numbered, bit, left):
 
 def main(printed):
     # No garbage collection while the maps load (millions of new objects, none of them garbage:
-    # the collections would only walk them, about 25 ms of CPU); afterwards they are frozen,
-    # so that the collections during the analysis never walk them either.
+    # the collections would only walk them, about 25 ms of CPU); afterwards they are frozen.
+    # The static analysis runs without collections too: its syntax trees are acyclic and freed
+    # by reference counting, and a collection after each parse only walks the new tree (about
+    # 15% of the parse). The collector runs again around the replays (they execute tests).
     gc.disable()
     maps = load_map(APP/"coverage.json.gz")
     maps["operands"] = load_map(APP/"operands.gz")
@@ -1078,7 +1092,6 @@ def main(printed):
     by_number = {test["number"]:test["id"] for test in tests}
     maps["tpcds"] = tpcds_replay.load(APP/"tpcds.gz")
     gc.freeze()
-    gc.enable()
     tpcds_id = maps["tpcds"]["test"] if maps["tpcds"] else None
     tpcds_bit = 1 << index[tpcds_id] if tpcds_id in index and any(t["id"] == tpcds_id for t in tests) else 0
     if maps["tpcds"] and maps["tpcds"]["count"] != len(maps["tpcds"]["cpu"]):
@@ -1121,7 +1134,11 @@ def main(printed):
             mask = all_mask
         if analysed and files and mask != all_mask and tpcds_bit and mask & tpcds_bit:
             try:
-                mask, tpcds_left = drop_tpcds(mask, files, skipped, file_masks, maps, numbered, tpcds_bit, tpcds_left)
+                gc.enable()
+                try:
+                    mask, tpcds_left = drop_tpcds(mask, files, skipped, file_masks, maps, numbered, tpcds_bit, tpcds_left)
+                finally:
+                    gc.disable()
             except Exception:
                 import sys, traceback
                 traceback.print_exc(file=sys.stderr)
@@ -1158,7 +1175,11 @@ def main(printed):
                     ids.append(n)
                     spare -= ms
                 start = time.monotonic()
-                failed = failing_tests(SOURCE,files,[by_number[n] for n in ids],min(2.4,remaining))
+                gc.enable()
+                try:
+                    failed = failing_tests(SOURCE,files,[by_number[n] for n in ids],min(2.4,remaining))
+                finally:
+                    gc.disable()
                 if failed is not None:
                     required = set(retained) | {n for n in ids if by_number[n] in failed}
                     if retained:

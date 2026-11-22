@@ -1,6 +1,6 @@
 """Narrow a selection when a complete syntax-tree comparison isolates one edit."""
 import ast
-from tree_equal import same_tree
+from tree_equal import same_tree, select
 import operator
 import json
 import math
@@ -497,9 +497,7 @@ def flag_edit(path, before, after, removed, maps, dynamic_names):
     flips = maps.get("flips")
     if not flips or not removed:
         return None
-    for cls in ast.walk(before):
-        if not isinstance(cls, ast.ClassDef):
-            continue
+    for cls in select(before, (ast.ClassDef,)):
         for old in cls.body:
             name = _setting_name(old)
             if name is None or not old.lineno <= min(removed) <= max(removed) <= old.end_lineno:
@@ -507,7 +505,7 @@ def flag_edit(path, before, after, removed, maps, dynamic_names):
             site = f"{path}:{old.lineno}:{name}"
             if site not in flips or name in dynamic_names:
                 return None
-            for new in ast.walk(after):
+            for new in select(after, (type(old),)):
                 if (type(new) is type(old) and new.lineno == old.lineno and _setting_name(new) == name
                         and new.value.value != old.value.value
                         and unchanged_with_original(after, before, new, {"value": old.value})):
@@ -678,12 +676,10 @@ def boolop_edit(path, before, after, removed, inserted, maps):
     if not profile or inserted or not removed:
         return None
     first, last = min(removed), max(removed)
-    olds = {(n.lineno, n.col_offset): n for n in ast.walk(before) if isinstance(n, ast.BoolOp)
-            and n.lineno <= first and last <= n.end_lineno}
+    olds = {(n.lineno, n.col_offset): n for n in select(before, (ast.BoolOp,))
+            if n.lineno <= first and last <= n.end_lineno}
     best = None
-    for new in ast.walk(after):
-        if not isinstance(new, ast.BoolOp):
-            continue
+    for new in select(after, (ast.BoolOp,)):
         old = olds.get((new.lineno, new.col_offset))
         if (old is None or type(old.op) is not type(new.op) or len(old.values) != len(new.values)
                 or same_tree(old, new)):
@@ -719,9 +715,7 @@ def boolop_edit(path, before, after, removed, inserted, maps):
 def swapped_boolop(path, before, after, removed, maps, olds):
     """Tests with an evaluation that swapping an operator between and and or could change."""
     profile = maps["boolops"]
-    for new in ast.walk(after):
-        if not isinstance(new, ast.BoolOp):
-            continue
+    for new in select(after, (ast.BoolOp,)):
         old = olds.get((new.lineno, new.col_offset))
         if (old is None or type(old.op) is type(new.op) or len(old.values) != len(new.values)
                 or any((not same_tree(a, b)) for a, b in zip(old.values, new.values))):

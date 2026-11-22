@@ -58,6 +58,91 @@ def _same(a, b):
     return True
 
 
+# Walks of the trees of one file analysis (pure speed). ast.walk(tree) yields the nodes breadth
+# first, each node's children in the order of iter_child_nodes; nodes(tree) is that sequence as a
+# list, computed once per tree. Statements (and except handlers and match cases) only occur in
+# list fields of statements, except handlers, match cases and modules, never inside expressions,
+# so the breadth first walk that only follows those list items yields exactly the subsequence of
+# ast.walk(tree) of the statement-like nodes, in the same order: select() uses it when every
+# requested type is a statement type. The lists are valid only while the trees keep the content
+# they had when the lists were made: mask_for_file resets them at its start and end, and they are
+# only read when no tree is temporarily altered (the recognizers restore every change before
+# they walk again; the one lasting change, normalize_comparisons, happens before any cached walk).
+_STATEMENT_LIKE = (ast.stmt, ast.excepthandler, ast.match_case)
+_nodes = {}
+_statements = {}
+_selected = {}
+
+
+def reset_walks():
+    _nodes.clear()
+    _statements.clear()
+    _selected.clear()
+
+
+def nodes(tree):
+    """list(ast.walk(tree))"""
+    found = _nodes.get(tree)
+    if found is None:
+        found = [tree]
+        append = found.append
+        i = 0
+        while i < len(found):
+            node = found[i]
+            i += 1
+            for name in node._fields:
+                value = getattr(node, name, None)
+                if isinstance(value, _AST):
+                    append(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, _AST):
+                            append(item)
+        _nodes[tree] = found
+    return found
+
+
+def _statement_nodes(tree):
+    found = _statements.get(tree)
+    if found is None:
+        found = [tree]
+        append = found.append
+        i = 0
+        while i < len(found):
+            node = found[i]
+            i += 1
+            for name in node._fields:
+                value = getattr(node, name, None)
+                if isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, _STATEMENT_LIKE):
+                            append(item)
+        _statements[tree] = found
+    return found
+
+
+def statement_children(node):
+    """The statement-like nodes among list(ast.iter_child_nodes(node)), in that order."""
+    found = []
+    for name in node._fields:
+        value = getattr(node, name, None)
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, _STATEMENT_LIKE):
+                    found.append(item)
+    return found
+
+
+def select(tree, types):
+    """[n for n in ast.walk(tree) if isinstance(n, types)] for a tuple of node types (do not modify it)"""
+    key = (tree, types)
+    found = _selected.get(key)
+    if found is None:
+        source = _statement_nodes(tree) if all(issubclass(t, ast.stmt) for t in types) else nodes(tree)
+        found = _selected[key] = [n for n in source if isinstance(n, types)]
+    return found
+
+
 def same_tree(a, b):
     """ast.dump(a) == ast.dump(b)"""
     if not isinstance(a, _AST) or not isinstance(b, _AST):
