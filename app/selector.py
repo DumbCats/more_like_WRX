@@ -159,6 +159,11 @@ GUARD_MIN = float(os.environ.get("BR_GUARD_MIN", "4.0"))  # (= TEST_TIMEOUT)
 GUARD_FACTOR = float(os.environ.get("BR_GUARD_FACTOR", "6.0"))
 GUARD_ADD = float(os.environ.get("BR_GUARD_ADD", "1.5"))
 GUARD_PRICE = float(os.environ.get("BR_GUARD_PRICE", "1.0"))  # charged seconds per CPU second of a run
+# Runaway guard (prepare_plan): a commit with one run and no held test stops that run at
+# TIGHT_GUARD_FACTOR x estimate + GUARD_ADD CPU s (at least GUARD_MIN). Passing runs in the corpus
+# use at most 15% of that limit. Stopping selects the test (miss-safe); BR_NO_TIGHT_GUARD=1 turns it off.
+TIGHT_GUARD = os.environ.get("BR_NO_TIGHT_GUARD") != "1"
+TIGHT_GUARD_FACTOR = float(os.environ.get("BR_TIGHT_GUARD_FACTOR", "6.0"))
 GUARD_RESTARTS = 3  # new children per commit after stopped tests; then the rest is selected unrun
 CPU_GUARD = {}  # in a child: test -> CPU seconds that its run may cost (the parent's plan.guard)
 # CPU seconds of a new child before its first test, by kind of commit (measured on the pinned tree)
@@ -5096,6 +5101,13 @@ def run(t_start, deadline, state):
                 if n in plan.protect and long_secs:
                     stake += max(long_secs)
                 limit = max(GUARD_MIN, GUARD_FACTOR * cost[n] + GUARD_ADD, stake / GUARD_PRICE)
+                if TIGHT_GUARD and len(ran) == 1 and not held and plan.mode == "hot":
+                    # Runaway guard: the only run of the commit (no held test, so no stage check
+                    # and no evidence rule depends on it; no later test shares its child) stops at
+                    # TIGHT_GUARD_FACTOR times its estimate. A stopped test is selected (conclude:
+                    # plan.suspects; finish selects suspects), so this can add a slow passing test
+                    # to the answer but never remove one.
+                    limit = min(limit, max(GUARD_MIN, TIGHT_GUARD_FACTOR * cost[n] + GUARD_ADD))
                 if limit < allowed[n] / SLOWDOWN:
                     plan.guard[n] = limit
         # Once a test has failed, the commit is known to break something. A further
