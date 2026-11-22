@@ -364,9 +364,18 @@ def lambda_edit(path, before, after, maps):
     for old, _ in changed:
         if any(f.lineno <= old.lineno <= f.end_lineno for f in functions):
             return None
+        reached = 0
         for line in range(old.lineno, old.end_lineno + 1):
-            key = str(line)
-            mask |= int(rows.get(key, "0"), 16) | int(imports.get(key, "0"), 16)
+            reached |= int(rows.get(str(line), "0"), 16)
+        if not reached:
+            # The coverage maps miss many lambda bodies that tests do call (e.g. the executor's
+            # ENV table in sqlglot/executor/env.py): a changed lambda with no recorded line falls
+            # back to every test that runs any code of this file.
+            for tests in rows.values():
+                reached |= int(tests, 16)
+        mask |= reached
+        for line in range(old.lineno, old.end_lineno + 1):
+            mask |= int(imports.get(str(line), "0"), 16)
     return mask
 
 
