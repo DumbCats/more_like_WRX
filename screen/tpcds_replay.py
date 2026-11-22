@@ -30,8 +30,18 @@ def load(path):
     except (OSError, ValueError):
         return None
     profile["setup"] = {p: set(ns) for p, ns in profile["setup"].items()}
-    profile["lines"] = {p: {int(n): int(m, 16) for n, m in row.items()} for p, row in profile["lines"].items()}
+    # the rows of a path are converted ({int(n): int(m, 16)}) when first read (_rows; pure speed)
+    profile["converted"] = {}
     return profile
+
+
+def _rows(profile, path):
+    """{int(n): int(m, 16) for n, m in profile["lines"][path].items()}, or {} for a path without rows."""
+    rows = profile["converted"].get(path)
+    if rows is None:
+        row = profile["lines"].get(path)
+        rows = profile["converted"][path] = {} if row is None else {int(n): int(m, 16) for n, m in row.items()}
+    return rows
 
 
 def outer_definitions(body):
@@ -50,14 +60,15 @@ def outer_definitions(body):
     return found
 
 
-def edited_bodies(base, revised):
+def edited_bodies(base, revised, parse_base=ast.parse, parse_revised=ast.parse):
     """Baseline functions whose bodies hold every difference, or None.
 
     None means some difference lies outside function bodies (module or class
-    level code, signatures, decorators) or the files do not parse.
+    level code, signatures, decorators) or the files do not parse. parse_base and
+    parse_revised give ast.parse of their text (the selector passes the trees it has).
     """
     try:
-        before, after = ast.parse(base), ast.parse(revised)
+        before, after = parse_base(base), parse_revised(revised)
     except SyntaxError:
         return None
     if same_tree(before, after):
@@ -119,7 +130,7 @@ def reach(func, first, removed, inserted, granular=True):
     return sorted(lines) if lines else whole
 
 
-def affected_queries(profile, files, other_masks, bit, granular=True):
+def affected_queries(profile, files, other_masks, bit, granular=True, parse_base=ast.parse, parse_revised=ast.parse):
     """(bitmask of TPC-DS queries the patch can reach, paths they reach), or None when ineligible.
 
     files are (path, base, revised, removed, inserted) tuples. other_masks maps
@@ -134,11 +145,11 @@ def affected_queries(profile, files, other_masks, bit, granular=True):
             continue
         if not path.startswith("sqlglot/"):
             return None
-        edited = edited_bodies(base, revised)
+        edited = edited_bodies(base, revised, parse_base, parse_revised)
         if edited is None:
             return None
         setup = profile["setup"].get(path, set())
-        rows = profile["lines"].get(path, {})
+        rows = _rows(profile, path)
         for func in edited:
             body_start = func.body[0].lineno
             if any(n in setup for n in range(body_start, func.end_lineno + 1)):

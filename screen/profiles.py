@@ -430,6 +430,14 @@ def changed_outcomes(profile, old, new):
     return risk
 
 
+def instruction_keys(path, maps):
+    """set(maps["instructions"][path]), made once per path."""
+    keys = maps["instruction_sets"].get(path)
+    if keys is None:
+        keys = maps["instruction_sets"][path] = set(maps["instructions"][path])
+    return keys
+
+
 def operation_edit(path, before, after, removed, maps):
     """An isolated operator or literal-argument edit first takes effect at its instruction."""
     if len(removed) != 1 or path not in maps["instructions"]:
@@ -447,7 +455,7 @@ def operation_edit(path, before, after, removed, maps):
         if id(old) not in deferred:
             return None
         key = f"{type(old).__name__}:{line}:{old.col_offset}:{old.end_col_offset}"
-        if key not in maps["instructions"][path]:
+        if key not in instruction_keys(path, maps):
             continue
         if isinstance(old,ast.Compare):
             if len(old.ops) != 1 or len(new.ops) != 1:

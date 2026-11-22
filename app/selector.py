@@ -7,9 +7,11 @@ that fail. Logs go to stderr; only the answers go to stdout.
 from __future__ import annotations
 
 import collections
+import functools
 import gc
 import json
 import marshal
+import operator
 import os
 import re
 import zlib
@@ -314,6 +316,7 @@ class Maps:
         self._classmap = None
         self._faithful = None
         self._tight = None
+        self._tight_raw = set()  # tests whose tight line sets are still blobs (tight_of)
         self._stages = None
         try:
             with open(os.path.join(path, "cost.bin"), "rb") as f:
@@ -426,15 +429,37 @@ class Maps:
                 try:
                     with open(os.path.join(self.path, "tight_lines.bin"), "rb") as f:
                         raw = marshal.loads(_unz(f.read()))
+                    # The line sets of a test are made when they are first read (tight_of): most
+                    # commits read none. A blob that array.frombytes refuses (not bytes, or a
+                    # length that is no multiple of the item size) is converted here, so that
+                    # it fails here as before.
+                    size = array("I").itemsize
                     for n, files in raw.items():
                         out = self._tight[n] = {}
                         for rel, blob in files.items():
-                            arr = array("I")
-                            arr.frombytes(blob)
-                            out[rel] = frozenset(arr)
+                            if type(blob) is bytes and not len(blob) % size:
+                                out[rel] = blob
+                                self._tight_raw.add(n)
+                            else:
+                                arr = array("I")
+                                arr.frombytes(blob)
+                                out[rel] = frozenset(arr)
                 except (OSError, ValueError, EOFError, zlib.error):
                     self._tight = {}
+                    self._tight_raw = set()
         return self._tight
+
+    def tight_of(self, n):
+        """tight_lines()[n] ({path: frozenset of lines}), its line sets made on first use."""
+        out = self._tight[n]
+        if n in self._tight_raw:
+            self._tight_raw.discard(n)
+            for rel, blob in list(out.items()):
+                if type(blob) is bytes:
+                    arr = array("I")
+                    arr.frombytes(blob)
+                    out[rel] = frozenset(arr)
+        return out
 
     def stages(self):
         """{test id: record} of the stage map (build_stages.py), each with the build-time
@@ -698,6 +723,30 @@ def _type_checking_spans(text):
 
 
 _TC_SPANS = None
+
+
+_PINNED_PARSE = None
+
+
+def pinned_parse(kind, rel, text):
+    """What build_pinned_parse.py stored under kind for the pinned file rel (from a parse of its
+    text), when text is the text that it read (same length and CRC-32, as for tc_spans.bin) and
+    this interpreter is the one that it ran on; else None."""
+    global _PINNED_PARSE
+    if _PINNED_PARSE is None:
+        _PINNED_PARSE = {}
+        try:
+            with open(os.path.join(MAPS, "pinned_parse.bin"), "rb") as f:
+                data = marshal.loads(f.read())
+            if type(data) is dict and data.get("version") == sys.version:
+                _PINNED_PARSE = data
+        except (OSError, ValueError, EOFError, TypeError):
+            pass
+    rows = _PINNED_PARSE.get(kind)
+    rec = rows.get(rel) if rows else None
+    if rec is None or rec[0] != len(text) or rec[1] != zlib.crc32(text.encode("utf-8", "surrogateescape")):
+        return None
+    return rec[2]
 
 
 def _old_type_checking_spans(rel, old_text):
@@ -972,7 +1021,7 @@ def plan_python_file(plan: Plan, fp, maps: Maps, old_text: str):
                                 break
                             dl |= d
                     if dl:
-                        kept = [n for n in found if n not in tight or not tight[n].get(rel, frozenset()).isdisjoint(dl)]
+                        kept = [n for n in found if n not in tight or not maps.tight_of(n).get(rel, frozenset()).isdisjoint(dl)]
                         if len(kept) != len(found):
                             plan.note.append("exact lines: %s not run" % sorted(set(found) - set(kept)))
                             found = kept
@@ -1041,16 +1090,37 @@ def _enum_body_lines(rel):
     out = _ENUM_LINES.get(rel)
     if out is not None:
         return out
+    text = patchrules.source(rel)
+    modname = rel[:-3].replace("/", ".").removesuffix(".__init__")
+    if sys.modules.get(modname) is None:
+        # the module is not loaded: the classes are told by their bases, as in the map that
+        # build_pinned_parse.py made of the pinned tree (when this text is the one it read)
+        spans = pinned_parse("enum", rel, text)
+        if spans is not None:
+            out = set()
+            for a, b in spans:
+                out.update(range(a, b + 1))
+            _ENUM_LINES[rel] = out
+            return out
+    out = set()
+    for a, b in _enum_spans(text, modname):
+        out.update(range(a, b + 1))
+    _ENUM_LINES[rel] = out
+    return out
+
+
+def _enum_spans(text, modname):
+    """(first, last line) of each Enum class body of the text of module modname (see
+    _enum_body_lines), in the order of the walk; [] when the text does not parse."""
     import ast
     import enum
 
-    out = set()
+    out = []
     try:
-        tree = ast.parse(patchrules.source(rel))
+        tree = ast.parse(text)
     except SyntaxError:
-        _ENUM_LINES[rel] = out
         return out
-    mod = sys.modules.get(rel[:-3].replace("/", ".").removesuffix(".__init__"))
+    mod = sys.modules.get(modname)
 
     def visit(body, prefix):
         for node in body:
@@ -1068,11 +1138,10 @@ def _enum_body_lines(rel):
                 if is_enum is None:
                     is_enum = any("Enum" in ast.unparse(b) or ast.unparse(b).endswith("AutoName") for b in node.bases)
                 if is_enum:
-                    out.update(range(node.lineno, node.end_lineno + 1))
+                    out.append((node.lineno, node.end_lineno))
                 visit(node.body, qual)
 
     visit(tree.body, [])
-    _ENUM_LINES[rel] = out
     return out
 
 
@@ -1639,7 +1708,143 @@ def shared_write_watch(units, old_text, new_text, groups):
 _KNOWN_TESTS = None
 
 
-def added_tests(plan: Plan, maps: Maps, rel, old_text, new_text):
+def _test_methods(text):
+    """{(class, method): its node} of the test methods (test*) of the top-level classes of a
+    test file's text; None when the text does not parse."""
+    import ast
+
+    try:
+        tree = ast.parse(text or "")
+    except (SyntaxError, ValueError):
+        return None
+    out = {}
+    for cls in tree.body:
+        if isinstance(cls, ast.ClassDef):
+            for fn in cls.body:
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name.startswith("test"):
+                    out[(cls.name, fn.name)] = fn
+    return out
+
+
+def _first_line(stmt):
+    """The first line of a statement, with its decorators."""
+    return min([stmt.lineno] + [x.lineno for x in getattr(stmt, "decorator_list", ())])
+
+
+def _top_statement_spans(tree):
+    """(first line, with the decorators; last line; for a class its name and the (first line,
+    last line) of each statement of its body, else None, None) of each top-level statement."""
+    import ast
+
+    return [
+        (_first_line(s), s.end_lineno, s.name, [(_first_line(x), x.end_lineno) for x in s.body])
+        if isinstance(s, ast.ClassDef) else (_first_line(s), s.end_lineno, None, None)
+        for s in tree.body
+    ]
+
+
+def _ends_continued(line):
+    return line.rstrip("\r").endswith("\\")
+
+
+def _cut(items, lo, hi, clean):
+    """(a, b) for statements items ((first line, last line, ...) in order, one block): a = the
+    first line of the last item but the first that starts at or before line lo, b = the last
+    line of the first item but the last that ends at or after line hi, each only where the
+    lines to the neighbor item are clean (see _patched_test_methods); None where none is."""
+    a = b = None
+    for i, it in enumerate(items):
+        s, e = it[0], it[1]
+        if s <= lo and i and items[i - 1][1] < s and clean(items[i - 1][1], s - 1):
+            a = s
+        if e >= hi and i + 1 < len(items) and items[i + 1][0] > e and clean(e, items[i + 1][0] - 1):
+            b = e
+            break
+    return a, b
+
+
+def _patched_test_methods(old_text, new_text, groups, spans):
+    """For the test file text new_text, made from the pinned text old_text by the line groups
+    `groups` (engine.FilePatch.groups): a dict that holds, in the same order and with the same
+    nodes, every entry of _test_methods(new_text) whose key the pinned text lacks (the other
+    entries can be missing); None when new_text does not parse. spans: the statements of
+    old_text (_top_statement_spans, from the map).
+
+    The patched lines lie between two places of the pinned text where one statement of a block
+    ends and the next one of the same block begins, with only blank and comment lines, none
+    with a line continuation, in between. The text before the first place and after the second
+    is the pinned text, which parses, and at each place the tokenizer is between two logical
+    lines, with the same indentation levels as in the pinned text. So the whole text parses
+    when the part in between does, as statements of that block (nothing in it ends the block),
+    and its statements are those of that part. The part is parsed alone, after blank lines (the
+    lines keep their numbers and columns):
+    - between two top-level statements: as top-level statements; every key of a class of the
+      other parts is a key of the pinned text;
+    - between two statements of the body of a top-level class C, whose patched first logical
+      line has the indentation of C's statements: inside a class whose body must then hold the
+      whole part; its methods are C's, the others of C are those of the pinned text.
+    When the part does not parse so, or no such places are found, the whole text is parsed
+    (_test_methods). (A future import of barry_as_FLUFL changes how the parser reads the code
+    after it: then too.)"""
+    if "barry_as_FLUFL" in new_text:
+        return _test_methods(new_text)
+    old_lines = old_text.split("\n")
+    new_lines = new_text.split("\n")
+    n_old = len(old_lines)
+    lo, hi = n_old + 1, 0
+    for o, nr, nl, na, removed, added in groups:
+        lo = min(lo, o if nr else o - 1)
+        hi = max(hi, o + nr - 1 if nr else o)
+
+    def clean(a, b):
+        # lines a..b (1-based) between two statements: blank or comments, none continued
+        return all(_ends_continued(x) is False for x in old_lines[a - 1:b]) and _blank_or_comment(old_lines[a:b])
+
+    def same_outside(start, end):
+        # the lines before start and after end (pinned) are those of new_text: the patched
+        # lines start..stop of new_text replace the pinned lines start..end
+        stop = len(new_lines) - (n_old - end)
+        if not 1 <= start <= stop + 1 or old_lines[:start - 1] != new_lines[:start - 1] or old_lines[end:] != new_lines[stop:]:
+            return None
+        return stop
+
+    for s, e, name, body in spans:
+        if name is not None and s <= lo and hi <= e:
+            start, end = _cut(body, lo, hi, clean)
+            if start is None or end is None:
+                break
+            stop = same_outside(start, end)
+            if stop is None or stop < start or _ends_continued(new_lines[stop - 1]):
+                break
+            indent = old_lines[start - 1][:len(old_lines[start - 1]) - len(old_lines[start - 1].lstrip())]
+            first = next((x for x in new_lines[start - 1:stop] if not _blank_or_comment([x])), None)
+            if not indent or first is None or not first.startswith(indent) or first[len(indent):len(indent) + 1] in ("", " ", "\t", "\f", "\\"):
+                break
+            import ast
+
+            try:
+                tree = ast.parse("\n" * (start - 2) + "class _:\n" + "\n".join(new_lines[start - 1:stop]) + "\n")
+            except (SyntaxError, ValueError):
+                break
+            if len(tree.body) != 1:
+                break
+            out = {}
+            for fn in tree.body[0].body:
+                if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name.startswith("test"):
+                    out[(name, fn.name)] = fn
+            return out
+    start, end = _cut(spans, lo, hi, clean)
+    start, end = start or 1, end or n_old
+    stop = same_outside(start, end)
+    tail = n_old - end  # pinned lines after the part
+    if stop is None or (tail and start <= stop and _ends_continued(new_lines[stop - 1])):
+        return _test_methods(new_text)
+    part = "\n" * (start - 1) + "\n".join(new_lines[start - 1:stop]) + ("\n" if tail else "")
+    got = _test_methods(part)
+    return _test_methods(new_text) if got is None else got
+
+
+def added_tests(plan: Plan, maps: Maps, rel, old_text, new_text, groups):
     """Test methods that the patch adds to a test file (in the new text, not in the old one).
     The full run runs them too, at their place in the pytest order (a class's methods run in
     name order). Their own result does not count, but a state they leave behind (a module
@@ -1659,21 +1864,22 @@ def added_tests(plan: Plan, maps: Maps, rel, old_text, new_text):
             if len(parts) >= 3:
                 _KNOWN_TESTS.setdefault((parts[0], parts[1]), {}).setdefault(parts[2].split("[")[0], n)
 
-    def methods(text):
-        try:
-            tree = ast.parse(text or "")
-        except (SyntaxError, ValueError):
-            return None
-        out = {}
-        for cls in tree.body:
-            if isinstance(cls, ast.ClassDef):
-                for fn in cls.body:
-                    if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)) and fn.name.startswith("test"):
-                        out[(cls.name, fn.name)] = fn
-        return out
-
-    new = methods(new_text)
-    old = methods(old_text) if old_text is not None else {}
+    got = pinned_parse("tests", rel, old_text) if old_text is not None else None
+    if got is not None and got[0] is not False:
+        # Only the keys of the pinned file's methods count, and of the patched file's only those
+        # that the pinned file does not have: the map of the pinned tree (build_pinned_parse.py)
+        # gives both the keys and the top-level statements, so only the patched lines between
+        # two of those need a parse (_patched_test_methods).
+        old = got[0]
+        new = _patched_test_methods(old_text, new_text, groups, got[1])
+    else:
+        new = _test_methods(new_text)
+        if old_text is None:
+            old = {}
+        elif got is not None:
+            old = None  # the pinned text does not parse
+        else:
+            old = _test_methods(old_text)
     if new is None or old is None:
         return  # a file that does not parse fails at import: the import check covers it
     for (cls_name, name), fn in new.items():
@@ -1774,7 +1980,7 @@ def make_plan(commit, text, maps: Maps, use_infect=INFECT) -> Plan:
                 plan.cands.update(n for n, tid in enumerate(maps.meta["test_ids"]) if tid.split("::")[0] in (path, fp.old_path))
             plan.note.append("source encoding changes the text of %s" % path)
         if is_py and path.startswith("tests/") and fp.status != "delete":
-            added_tests(plan, maps, path, old_text if fp.status != "add" else None, fp.new_text)
+            added_tests(plan, maps, path, old_text if fp.status != "add" else None, fp.new_text, fp.groups)
         scope = patchrules.pytest_scope(maps, fp, path, old_text)
         if scope is not None:
             # pytest itself reads this file (conftest.py, its options); the direct runs do not
@@ -4349,14 +4555,32 @@ def pack(numbers, seconds):
     if not numbers:
         return []
     items = sorted(numbers, key=lambda n: -seconds[n])
+    vals = [seconds[n] for n in items]
+    # With finite non-negative numbers (no NaN: then the sort orders them, largest first), the
+    # worker that gets the longest test ends with a load of at least vals[0] (float rounding
+    # is monotone), so k workers cost at least vals[0] + WORKER_COST * k, which grows with k:
+    # once that is no gain over the best so far, no larger k can be (the loop stops where it
+    # would only have kept the best). One worker gets every test, its load summed in order.
+    bounded = False
+    if {type(v) for v in vals} <= {float, int} and vals[-1] >= 0:
+        total = sum(vals)
+        bounded = total == total and total != float("inf")
     best = None
     for k in range(1, min(8, len(items)) + 1):
+        if bounded and best is not None and vals[0] + WORKER_COST * k >= best[0] - 1e-9:
+            break
         loads = [0.0] * k
         bins = [[] for _ in range(k)]
-        for n in items:
-            i = loads.index(min(loads))
-            loads[i] += seconds[n]
-            bins[i].append(n)
+        if k == 1:
+            loads[0] = functools.reduce(operator.add, vals, 0.0)
+            bins[0] = list(items)
+        else:
+            index = loads.index
+            appends = [b.append for b in bins]
+            for n, v in zip(items, vals):
+                i = index(min(loads))
+                loads[i] += v
+                appends[i](n)
         cost = max(loads) + WORKER_COST * k
         if best is None or cost < best[0] - 1e-9:
             best = (cost, bins)

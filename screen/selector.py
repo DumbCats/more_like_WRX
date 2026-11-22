@@ -158,6 +158,20 @@ def syntax(source):
     return ast.parse(source)
 
 
+# The revised trees of the current commit by text (pure speed: the TPC-DS check parses the same
+# texts again). file_mask adds a tree once it compiled and drops it when normalize_comparisons
+# changed it for good; every other change to a tree is undone before its recognizer returns, so
+# a tree kept here has the content ast.parse gives for its text. main clears it per commit; at most
+# three trees are kept (memory), a text without one is parsed again.
+_revised_trees = {}
+
+
+def revised_syntax(source):
+    """ast.parse(source), the tree of the current commit when there is one."""
+    tree = _revised_trees.get(source)
+    return ast.parse(source) if tree is None else tree
+
+
 def identity_equivalent(left, right):
     if left == right == "identity":
         return True
@@ -169,6 +183,8 @@ def identity_equivalent(left, right):
 
 
 def normalize_comparisons(before, after, path, operands):
+    """Give comparisons of after the operator of before where the operands make them equivalent: True if any changed."""
+    changed = False
     groups = {ast.Is:1, ast.Eq:1, ast.IsNot:2, ast.NotEq:2}
     for old,new in zip(ast.walk(before),ast.walk(after)):
         if not isinstance(old,ast.Compare) or not isinstance(new,ast.Compare):
@@ -182,6 +198,8 @@ def normalize_comparisons(before, after, path, operands):
         left,right = operands.get(key+"0"),operands.get(key+"1")
         if left and right and all(identity_equivalent(x,y) for x in left for y in right):
             new.ops[0] = old.ops[0]
+            changed = True
+    return changed
 
 
 def added_method_receivers(path, before, after, maps):
@@ -531,14 +549,18 @@ def documentation_edit(path, before, after, removed, inserted, maps):
         new = twin.body[0].value
         if not isinstance(new, ast.Constant) or type(new.value) is not str or new.value == old.value:
             continue
-        import doctest
-        def examples(doc):
-            return [(e.source, e.want, e.exc_msg, e.options) for e in doctest.DocTestParser().get_examples(doc)]
-        try:
-            if examples(new.value) != examples(old.value):
+        # Every doctest example starts with a ">>>" prompt (the PS1 line of DocTestParser's
+        # example pattern), so a docstring without one has no examples: get_examples returns []
+        # for it without raising. Only then are both lists empty and equal without the parser.
+        if ">>>" in new.value or ">>>" in old.value:
+            # examples(doc) == [(e.source, e.want, e.exc_msg, e.options) for e in
+            # doctest.DocTestParser().get_examples(doc)], without importing doctest (doctest_examples.py)
+            from doctest_examples import examples
+            try:
+                if examples(new.value) != examples(old.value):
+                    continue
+            except ValueError:
                 continue
-        except ValueError:
-            continue
         twin.body[0].value = old
         try:
             if same_tree(before, after):
@@ -557,7 +579,7 @@ def removed_parser_members(path, before, after, removed, maps):
         return None
     remainder = copy(before)
     remainder.body = list(before.body)
-    observers = maps["cold_imports"][path]
+    observers = cold_mask(path, maps)
     changed = False
     for index, cls in enumerate(before.body):
         if not (isinstance(cls, ast.ClassDef) and not cls.decorator_list and not cls.keywords
@@ -600,6 +622,20 @@ def removed_parser_members(path, before, after, removed, maps):
     return None
 
 
+def cold_mask(path, maps):
+    """The tests a cold import of path (a key of maps["cold_imports"]) can affect."""
+    mask = maps["cold_masks"].get(path)
+    if mask is None:
+        mask = int(maps["cold_imports"][path], 16) | child_mask(path, maps)
+        mask |= int(maps["source_readers"].get(path, "0"), 16)
+        # Augment isolation with evidence from the ordered full suite, in
+        # case an earlier test initialized a cached object for a later one.
+        for value in maps["lines"].get(path, {}).values():
+            mask |= int(value, 16)
+        maps["cold_masks"][path] = mask
+    return mask
+
+
 def mask_for_file(*args, **kwargs):
     # the cached walks (tree_equal.select) of this file's trees live only during its analysis
     reset_walks()
@@ -624,6 +660,8 @@ def file_mask(path, base, revised, removed, inserted, maps, all_mask, neighbors,
     try:
         before, after = syntax(base), ast.parse(revised)
         compile(after, path, "exec", dont_inherit=True)
+        if path.startswith("sqlglot/") and len(_revised_trees) < 3:  # the TPC-DS check reads no others
+            _revised_trees[revised] = after
     except SyntaxError:
         # A test module that no longer compiles fails to import, which fails its
         # own tests and those of every test module importing it.
@@ -636,7 +674,8 @@ def file_mask(path, base, revised, removed, inserted, maps, all_mask, neighbors,
     if removed:
         original_lines = base.splitlines()
         if any(re.search(r"\bis\b|!=|==", original_lines[n-1]) for n in removed):
-            normalize_comparisons(scoped_before, scoped_after, path, maps.get("operands",{}))
+            if normalize_comparisons(scoped_before, scoped_after, path, maps.get("operands",{})):
+                _revised_trees.pop(revised, None)  # after changed for good: not shared
     if same_tree(scoped_before, scoped_after):
         return readers
     doc = documentation_edit(path, before, after, removed, inserted, maps)
@@ -651,7 +690,7 @@ def file_mask(path, base, revised, removed, inserted, maps, all_mask, neighbors,
     if inserted and not removed:
         local = inert_statement(path, base, before, after, inserted, maps)
         if local is not None:
-            return readers | (local & maps["cold_imports"].get(path, all_mask))
+            return readers | (local & (cold_mask(path, maps) if path in maps["cold_imports"] else all_mask))
     # A one-line replacement outside an annotation cannot be erased by
     # ignoring annotations. Avoid copying and dumping the full module twice.
     check_annotations = True
@@ -903,7 +942,58 @@ def schedule(tests):
     return [[number for _, number in w] for w in best if w]
 
 
+_test_order = []  # [numbered, its bit positions, its tests (ms, n, position) sorted, width] (_numbered_order)
+
+
+def _numbered_order(numbered):
+    """Bit positions and sorted tests of numbered, or None unless every ms and n is an int."""
+    if not _test_order or _test_order[0] is not numbered:
+        positions = [None if bit is None else bit.bit_length() - 1 for bit, _ in numbered]
+        exact = all(type(ms) is int and type(n) is int for _, (ms, n) in numbered) and all(
+            bit is None or (type(bit) is int and bit > 0 and bit == 1 << p) for (bit, _), p in zip(numbered, positions))
+        tests = sorted((ms, n, p) for (_, (ms, n)), p in zip(numbered, positions) if p is not None) if exact else None
+        width = max((p + 1 for p in positions if p is not None), default=1)
+        _test_order[:] = [numbered, positions, tests, width]
+    return _test_order[1:] if _test_order[2] is not None else None
+
+
 def schedule_with_margin(mask, nearby, numbered, duration, widen):
+    # Pure speed: each test's bit (1 << position) is looked up in the binary digits of mask and
+    # nearby (the same answers as bit & mask, bit & nearby, for non-negative ints), and the
+    # optional tests come from one sort of all tests by (ms, n): sorted((not near, ms, n)) lists
+    # the near tests by (ms, n) and then the others by (ms, n), and with int ms and n those are
+    # the same sequences of (ms, n). In each of the two runs ms never decreases and min(loads)
+    # only changes when a test is added, so once a test does not fit none of the rest of its run
+    # does: the run ends there (the loop of the general form would only skip them).
+    fast = _numbered_order(numbered) if type(mask) is int and type(nearby) is int and mask >= 0 and nearby >= 0 else None
+    if fast is None:
+        return _schedule_with_margin(mask, nearby, numbered, duration, widen)
+    positions, tests, width = fast
+    selected = format(mask, "b").zfill(width)[::-1]  # selected[p] == "1" exactly when mask >> p & 1
+    required = [t for (_, t), p in zip(numbered, positions) if p is None or selected[p] == "1"]
+    workers = schedule(required)
+    if not widen:
+        return workers
+    if not workers:
+        return []
+    loads = [sum(duration[n] for n in w) for w in workers]
+    ceiling = max(loads)
+    close = format(nearby, "b").zfill(width)[::-1]
+    near, far = [], []
+    for ms, n, p in tests:
+        if selected[p] == "0":
+            (near if close[p] == "1" else far).append((ms, n))
+    for run in (near, far):
+        for ms, n in run:
+            i = loads.index(min(loads))
+            if loads[i] + ms > ceiling:
+                break
+            workers[i].append(n)
+            loads[i] += ms
+    return workers
+
+
+def _schedule_with_margin(mask, nearby, numbered, duration, widen):
     required = [t for bit,t in numbered if bit is None or bit & mask]
     workers = schedule(required)
     if not widen:
@@ -942,9 +1032,10 @@ def drop_tpcds(mask, files, skipped, file_masks, maps, numbered, bit, left):
     profile = maps["tpcds"]
     if any(file_masks.get(path, bit) & bit for path in skipped):
         return mask, left
-    found = tpcds_replay.affected_queries(profile, files, file_masks, bit)
+    found = tpcds_replay.affected_queries(profile, files, file_masks, bit, parse_base=syntax, parse_revised=revised_syntax)
     if found is not None and not found[0]:
-        found = tpcds_replay.affected_queries(profile, files, file_masks, bit, granular=False)
+        found = tpcds_replay.affected_queries(profile, files, file_masks, bit, granular=False,
+                                              parse_base=syntax, parse_revised=revised_syntax)
     if found is None or not found[0]:
         return mask, left
     queries, reached = found
@@ -999,7 +1090,9 @@ def main(printed):
     maps["unmeasured_branch"] = int(branch["unmeasured"], 16)
     maps["branch_orders"] = branch["orders"]
     maps["choices"] = branch["choices"]
-    maps["instructions"] = {path:set(keys) for path,keys in load_map(APP/"instructions.gz").items()}
+    # {path: [keys]}; profiles.instruction_keys gives set(keys) of a path, made when first read (pure speed)
+    maps["instructions"] = load_map(APP/"instructions.gz")
+    maps["instruction_sets"] = {}
     index = {name:i for i,name in enumerate(maps["names"])}
     maps["test_files"] = {}
     for name, i in index.items():
@@ -1072,15 +1165,9 @@ def main(printed):
     cold = load_map(APP/"cold-imports.gz")
     if cold["names"] != maps["names"]:
         raise ValueError("cold import inventory mismatch")
-    maps["cold_imports"] = {}
-    for path, bits in cold["sites"].items():
-        mask = int(bits, 16) | child_mask(path, maps)
-        mask |= int(maps["source_readers"].get(path, "0"), 16)
-        # Augment isolation with evidence from the ordered full suite, in
-        # case an earlier test initialized a cached object for a later one.
-        for value in maps["lines"].get(path, {}).values():
-            mask |= int(value, 16)
-        maps["cold_imports"][path] = mask
+    # the masks of cold_mask(), computed when first read (pure speed: the maps they read never change)
+    maps["cold_imports"] = dict(cold["sites"])
+    maps["cold_masks"] = {}
     maps["fixture_paths"] = load_map(APP/"fixture-paths.gz")
     if maps["fixture_paths"]["names"] != maps["names"]:
         raise ValueError("fixture path inventory mismatch")
@@ -1100,6 +1187,7 @@ def main(printed):
     schedules = {}
     remaining = float(os.environ.get("SCREEN_REPLAY_BUDGET", "22.0"))
     for patch in sorted((DATA/"commits").glob("*.patch")):
+        _revised_trees.clear()
         mask = 0
         neighbors = []
         files = []
@@ -1125,7 +1213,7 @@ def main(printed):
                 except SyntaxError:
                     if len(files) != 1 or skipped or args[0] not in maps["cold_imports"]:
                         raise
-                    file_masks[args[0]] = maps["cold_imports"][args[0]]
+                    file_masks[args[0]] = cold_mask(args[0], maps)
                 mask |= file_masks[args[0]]
             if neighbors:
                 mask |= int(maps.get("opaque","0"),16)
@@ -1138,6 +1226,7 @@ def main(printed):
                 try:
                     mask, tpcds_left = drop_tpcds(mask, files, skipped, file_masks, maps, numbered, tpcds_bit, tpcds_left)
                 finally:
+                    _revised_trees.clear()
                     gc.disable()
             except Exception:
                 import sys, traceback

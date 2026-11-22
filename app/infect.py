@@ -147,10 +147,23 @@ def _parse_unit(lines, start, end, class_path):
         return None
     head = "".join(" " * k + "class " + name + ":\n" for k, name in enumerate(class_path))
     src = "\n" * pad + head + "\n".join(lines[start - 1:end]) + "\n"
+    # The phase 1 and phase 2 edits and statement_runners parse the same units of a commit:
+    # one parse of each text (the trees are only read).
+    got = _TREES.get(src, _NO_TREE)
+    if got is not _NO_TREE:
+        return got
+    if len(_TREES) >= 64:
+        _TREES.clear()
     try:
-        return ast.parse(src)
+        got = ast.parse(src)
     except (SyntaxError, ValueError):
-        return None
+        got = None
+    _TREES[src] = got
+    return got
+
+
+_TREES = {}  # source text -> its tree (None: it does not parse), see _parse_unit
+_NO_TREE = object()
 
 
 def single_compare_edit(old_lines, new_lines, groups, units):

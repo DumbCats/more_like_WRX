@@ -64,8 +64,18 @@ LISTING_WORDS = ("listdir", "scandir", "iterdir", "iter_modules", "walk_packages
 
 
 def _lists(text):
-    # the substring test first: a regex that starts with \b scans slowly
-    return any(w in text for w in LISTING_WORDS) and LISTING_RE.search(text) is not None
+    """LISTING_RE.search(text) is not None, without the regex scan (which starts with \\b and so
+    scans slowly): every match starts where one of _LISTING_STARTS occurs; there, \\b holds when
+    the character before is not a word character (as re's \\w: alphanumeric or "_"), and the
+    rest of the match is _LISTING_AT.match at that place."""
+    find, match = text.find, _LISTING_AT.match
+    for w in _LISTING_STARTS:
+        p = find(w)
+        while p >= 0:
+            if (p == 0 or not (text[p - 1].isalnum() or text[p - 1] == "_")) and match(text, p) is not None:
+                return True
+            p = find(w, p + 1)
+    return False
 
 
 SCAN_RE = re.compile(r"\b(?:scandir|iterdir|r?glob)\s*\(|\bos\.walk\s*\(")
@@ -92,6 +102,9 @@ def install_listing_overlay(root, files):
 
 
 LISTING_RE = re.compile(r"\b(?:listdir|scandir|iterdir|iter_modules|walk_packages|r?glob)\s*\(|\bos\.walk\s*\(")
+# LISTING_RE without the \b (checked by hand in _lists), and the words its matches start with
+_LISTING_AT = re.compile(r"(?:listdir|scandir|iterdir|iter_modules|walk_packages|r?glob)\s*\(|os\.walk\s*\(")
+_LISTING_STARTS = ("listdir", "scandir", "iterdir", "iter_modules", "walk_packages", "rglob", "glob", "os.walk")
 
 
 def listing_tests(maps):
