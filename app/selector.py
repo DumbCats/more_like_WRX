@@ -132,10 +132,12 @@ STOP_AT_COLLECTION = os.environ.get("BR_STOP_AT_COLLECTION", "1") == "1"
 # whether the labels stop at the collection error or also count the tests that fail when they run.
 COLLECTION_ALL = os.environ.get("BR_COLLECTION", "all") == "all"
 RESTRICT = None  # commit -> tests.json numbers that the static selector keeps (launch.py)
+SCREEN_CUT = os.environ.get("BR_SCREEN_CUT", "1") == "1"  # no run of a test that the static selector leaves out (choose)
+SCREEN_SKIP = os.environ.get("BR_SCREEN_SKIP", "1") == "1"  # no runs for a commit whose static answer is empty
 # The stage check of the long executor test (stages.py), for a commit that would select that
 # test without a run: "1" on, "0" off. For validation: "always" = whenever the test is held,
 # "force" = the test is always held and checked.
-STAGE = os.environ.get("BR_STAGE", "1")
+STAGE = os.environ.get("BR_STAGE", "always")
 MEMO = os.environ.get("BR_MEMO", "1") == "1"  # the step memo of the stage check (memo.py); BR_MEMO=0 turns it off
 # CPU seconds (as measured when the stage map was built) that a check may cost for each
 # second that leaving the test out of the answer saves. A check that proves a pass costs CPU
@@ -4467,6 +4469,32 @@ def release_pin_if_slow():
         _PIN = None
 
 
+def unreadable_python(commit):
+    """True when the patch of this commit adds, to a Python file, a line that is not UTF-8 or
+    holds a NUL byte. Python cannot read such a file, so its import fails whatever the line
+    is (a comment too), and the answers of the selectors (which read patches as text) do not
+    count: every test is selected. Also True when the patch cannot be read at all."""
+    try:
+        with open(os.path.join(DATA, "commits", commit + ".patch"), "rb") as f:
+            data = f.read()
+    except OSError:
+        return True
+    python = False
+    for line in data.split(bytes([10])):
+        if line.startswith(b"+++ "):
+            python = line.rstrip().endswith(b".py")
+        elif line.startswith(b"diff --git "):
+            python = False
+        elif python and line.startswith(b"+"):
+            if bytes(1) in line:
+                return True
+            try:
+                line.decode("utf-8")
+            except UnicodeDecodeError:
+                return True
+    return False
+
+
 def main():
     pin_to_one_cpu()
     t_start = time.monotonic()
@@ -4505,6 +4533,10 @@ def main():
                 everything = pack(list(range(len(tests))), seconds)
             workers = everything
         allowed = RESTRICT.get(c) if RESTRICT is not None else None
+        if unreadable_python(c):
+            if everything is None:
+                everything = pack(list(range(len(tests))), seconds)
+            workers, allowed = everything, None
         if allowed is not None:
             # both answers hold every failing test, so the tests that both select do too
             chosen = [n for w in workers for n in w]
@@ -4829,6 +4861,19 @@ def run(t_start, deadline, state):
             plan.note.append("no shared container to watch")
             plan.watch = []
         cands = sorted(plan.cands - plan.blind)
+        allowed = RESTRICT.get(plan.commit) if RESTRICT is not None and SCREEN_CUT and not RUN_ALL else None
+        if allowed is not None:
+            # The answer keeps only tests that the static selector also selects (main). The
+            # static selector leaves a test out only when the change cannot alter how it runs
+            # (it never reaches the changed code, or reaches it with the same outcome): such a
+            # test passes as on the pinned tree and leaves the same state for the later ones,
+            # so it is no candidate here either.
+            number = state.get("number")
+            kept = [n for n in cands if (n if number is None else number[n]) in allowed]
+            if len(kept) < len(cands):
+                plan.note.append("static cut: %d -> %d runs" % (len(cands), len(kept)))
+                plan.cands.difference_update(set(cands) - set(kept))
+                cands = kept
         cost = {n: estimate_cost(n, plan, maps, seconds) for n in cands}
         if plan.mode != "hot" and "import state unchanged" not in plan.note:
             for cls_id, setup in CLASS_SETUP_SECONDS.items():
@@ -5422,13 +5467,13 @@ def run(t_start, deadline, state):
     hot, fresh = [], []
     for c in commits:
         plan = plans[c]
-        if RESTRICT is not None and plan.mode in ("hot", "fresh", "fresh_cone", "fresh_purge") \
-                and RESTRICT.get(c) is not None and not RESTRICT[c]:
-            # The static selector keeps no test of this commit: main() prints the tests that
-            # both select, so the line is [] whatever the runs would find. Its runs only cost CPU.
+        if (RESTRICT is not None and SCREEN_SKIP and not RUN_ALL and plan.mode in ("hot", "fresh")
+                and c in RESTRICT and not RESTRICT[c]):
+            # The answer keeps only tests that the static selector selects (main), and it
+            # selects none: no run can change the answer.
             answers[c] = []
             if DEBUG:
-                debug_rows[c] = {"mode": "screen_empty", "cands": sorted(plan.cands), "verdicts": {}, "note": plan.note}
+                debug_rows[c] = {"mode": "static", "cands": [], "verdicts": {}, "note": plan.note}
             continue
         if plan.mode == "all":
             answers[c] = pack(all_tests, seconds)

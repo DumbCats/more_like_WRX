@@ -55,4 +55,7 @@ if __name__ == "__main__":
     print("static answers:", None if impact_pipeline.RESTRICT is None else len(impact_pipeline.RESTRICT),
           "in", round(time.monotonic() - start, 2), "s", file=sys.stderr)
     impact_pipeline.WALL_LIMIT = max(30.0, impact_pipeline.WALL_LIMIT - (time.monotonic() - start))
+    # a large batch gets up to WALL_MAX seconds (selector.wall_limit); the time that the static
+    # selector took counts against it, so that both together stay inside the final's 4.5 minutes
+    impact_pipeline.WALL_MAX = max(30.0, impact_pipeline.WALL_MAX - (time.monotonic() - start))
     impact_pipeline.main()
